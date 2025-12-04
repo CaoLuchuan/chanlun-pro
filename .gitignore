@@ -144,7 +144,9 @@ web/chanlun_kcm
 web/chanlun_chart/cl_app/static/datafeeds/udf/node_modules
 src/Kronos
 
-.idea
+.claude/
+.idea/
+.trae/
 .virtual_documents
 **/__pycache__
 **/.ipynb_checkpoints

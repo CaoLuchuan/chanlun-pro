@@ -1,5 +1,6 @@
 # 缠论市场 WEB 分析工具
-
+激活环境
+ conda activate chanlun
 ---
 
 [![Documentation Status](https://readthedocs.org/projects/chanlun-pro/badge/?version=latest)](https://chanlun-pro.readthedocs.io/zh_CN/latest/?badge=latest)

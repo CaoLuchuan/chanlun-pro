@@ -168,6 +168,10 @@ class ChartManager {
   // 初始化图表
   init() {
     this.udf_datafeed = new Datafeeds.UDFCompatibleDatafeed("/tv", 30000);
+    let theme = Utils.get_local_data("theme");
+    if (theme === "dark") {
+      theme = "Dark";
+    }
     this.widget = window.tvWidget = new TradingView.widget({
       debug: false,
       autosize: true,
@@ -179,7 +183,14 @@ class ChartManager {
       ),
       datafeed: this.udf_datafeed,
       library_path: "static/charting_library/",
-      theme: Utils.get_local_data("theme"),
+      theme: theme,
+      overrides: {
+        "paneProperties.background": theme === "Dark" ? "#131722" : "#ffffff",
+        "paneProperties.backgroundType": "solid",
+      },
+      loading_screen: {
+        backgroundColor: theme === "Dark" ? "#131722" : "#ffffff",
+      },
       numeric_formatting: { decimal_sign: "." },
       time_frames: [],
       timezone: "Asia/Shanghai",
@@ -276,6 +287,17 @@ class ChartManager {
         console.error("Failed to get active chart");
         return;
       }
+
+      // 强制应用主题背景色
+      let theme = Utils.get_local_data("theme");
+      if (theme === "dark") {
+        theme = "Dark";
+      }
+      const bgColor = theme === "Dark" ? "#131722" : "#ffffff";
+      this.widget.applyOverrides({
+        "paneProperties.background": bgColor,
+        "paneProperties.backgroundType": "solid",
+      });
 
       // 订阅事件
       this.chart

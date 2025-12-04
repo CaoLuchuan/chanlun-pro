@@ -116,8 +116,7 @@ var TvIdxHDLY = (function () {
 
             if (big_money.get(0) > -150) {
               try {
-                const current_big_money = big_money.get(0);
-                if (isNaN(current_big_money)) {
+                if (big_money.get(0) == NaN || big_money.get(1) == NaN) {
                   return [NaN, NaN];
                 }
               } catch (error) {

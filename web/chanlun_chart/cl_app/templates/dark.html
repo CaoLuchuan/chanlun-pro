@@ -8,7 +8,7 @@
             } catch (d) {
                 b = {};
             }
-            if ("dark" === b.theme) {
+            if ("Dark" === b.theme || "dark" === b.theme) {
                 var a = document.createElement("link");
                 a.href = "{{ url_for('static', filename='css/layui-theme-dark.css') }}";
                 a.rel = "stylesheet";
