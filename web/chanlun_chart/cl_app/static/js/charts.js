@@ -172,6 +172,17 @@ class ChartManager {
     if (theme === "dark") {
       theme = "Dark";
     }
+    const marketTzMaps = {
+      a: "Asia/Shanghai",
+      hk: "Asia/Shanghai",
+      fx: "Asia/Shanghai",
+      us: "America/New_York",
+      futures: "Asia/Shanghai",
+      ny_futures: "Asia/Shanghai",
+      currency: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      currency_spot: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    };
+    const tz = marketTzMaps[Utils.get_market()] || Intl.DateTimeFormat().resolvedOptions().timeZone;
     this.widget = window.tvWidget = new TradingView.widget({
       debug: false,
       autosize: true,
@@ -193,7 +204,7 @@ class ChartManager {
       },
       numeric_formatting: { decimal_sign: "." },
       time_frames: [],
-      timezone: "Asia/Shanghai",
+      timezone: tz,
       locale: "zh",
       symbol_search_request_delay: 100,
       auto_save_delay: 5,

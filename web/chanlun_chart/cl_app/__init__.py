@@ -43,6 +43,7 @@ from chanlun.exchange import get_exchange
 from chanlun.exchange.stocks_bkgn import StocksBKGN
 from chanlun.tools.ai_analyse import AIAnalyse
 from chanlun.zixuan import ZiXuan
+from chanlun.file_db import FileCacheDB
 
 from .alert_tasks import AlertTasks
 from .other_tasks import OtherTasks
@@ -494,6 +495,12 @@ def create_app(test_config=None):
 
         market = symbol.split(":")[0].lower()
         code = symbol.split(":")[1]
+
+        if firstDataRequest == "true":
+            try:
+                FileCacheDB().clear_web_cl_data(market, code)
+            except Exception:
+                pass
 
         ex = get_exchange(Market(market))
 
