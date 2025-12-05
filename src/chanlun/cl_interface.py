@@ -684,9 +684,11 @@ class TZXL:
 
     def update_maxmin(self):
         if self.bh_direction == "up":
+            # 向上包含处理：取高高（最高价和最高价中的最高值，最低价和最低价中的最高值）
             self.max = max([_l.high for _l in self.lines])
             self.min = max([_l.low for _l in self.lines])
         else:
+            # 向下包含处理：取低低（最高价和最高价中的最低值，最低价和最低价中的最低值）
             self.max = min([_l.high for _l in self.lines])
             self.min = min([_l.low for _l in self.lines])
 

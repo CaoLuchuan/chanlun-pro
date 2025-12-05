@@ -13,6 +13,7 @@ from chanlun.cl_interface import (
     ICL, Config, Kline, CLKline, FX, BI, XD, ZS, MMD, BC, LINE, TZXL, XLFX,
     query_macd_ld, compare_ld_beichi, user_custom_mmd
 )
+from chanlun.cl_utils import cal_macd_bis_is_bc
 
 
 class CL(ICL):
@@ -247,7 +248,7 @@ class CL(ICL):
         )
         self.cl_klines.append(ck0)
 
-        direction = "up"
+        direction = None  # 初始方向未知，需要根据实际K线关系确定
 
         for i in range(1, len(self.klines)):
             k = self.klines[i]
@@ -258,13 +259,19 @@ class CL(ICL):
                 is_included = True
             
             if is_included:
+                # 缠论时间优先级原则：包含处理方向由前一个非包含K线决定
+                # 如果还没有确定方向，根据价格关系确定
+                if direction is None:
+                    # 根据前一根K线的收盘价关系确定方向
+                    direction = "up" if k.c > last_ck.c else "down"
+                
                 new_h = 0
                 new_l = 0
                 if direction == "up":
                     new_h = max(last_ck.h, k.h)
-                    new_l = max(last_ck.l, k.l)
+                    new_l = max(last_ck.l, k.l)  # 向上处理：取高高
                 else:
-                    new_h = min(last_ck.h, k.h)
+                    new_h = min(last_ck.h, k.h)  # 向下处理：取低低
                     new_l = min(last_ck.l, k.l)
                 
                 last_ck.h = new_h
@@ -275,10 +282,14 @@ class CL(ICL):
                 last_ck.klines.append(k)
                 last_ck.n += 1
             else:
+                # 修复：方向判断基于时间优先级
                 if k.h > last_ck.h and k.l > last_ck.l:
                     direction = "up"
                 elif k.h < last_ck.h and k.l < last_ck.l:
                     direction = "down"
+                else:
+                    # 非标准情况，根据价格关系确定方向
+                    direction = "up" if k.c > last_ck.c else "down"
                 
                 new_ck = CLKline(
                     k_index=k.index,
@@ -301,12 +312,17 @@ class CL(ICL):
             return
 
         fx_qj = self.config["fx_qj"]
+        fx_bh = self.config["fx_bh"]
         
-        for i in range(1, len(self.cl_klines) - 1):
-            k1 = self.cl_klines[i-1]
-            k2 = self.cl_klines[i]
-            k3 = self.cl_klines[i+1]
+        # 首先对K线进行分型级别的包含处理
+        processed_klines = self._process_fx_klines(self.cl_klines, fx_bh)
+        
+        for i in range(1, len(processed_klines) - 1):
+            k1 = processed_klines[i-1]
+            k2 = processed_klines[i]
+            k3 = processed_klines[i+1]
             
+            # 检查是否为有效的分型
             fx_type = None
             if k2.h > k1.h and k2.h > k3.h:
                 fx_type = "ding"
@@ -314,6 +330,23 @@ class CL(ICL):
                 fx_type = "di"
             
             if fx_type:
+                # 检查分型有效性：确保分型K线不是被包含的K线
+                if hasattr(k2, '_is_included') and k2._is_included:
+                    continue  # 跳过被包含的K线作为分型中心
+                
+                # 检查分型之间是否有足够的K线（至少1根K线间隔）
+                if len(self.fxs) > 0:
+                    last_fx = self.fxs[-1]
+                    k_diff = abs(k2.index - last_fx.k.index)
+                    if k_diff < 2:  # 至少需要1根K线间隔
+                        # 保留更极值的分型
+                        if fx_type == "ding" and k2.h > last_fx.val:
+                            self.fxs.pop()
+                        elif fx_type == "di" and k2.l < last_fx.val:
+                            self.fxs.pop()
+                        else:
+                            continue
+                
                 val = 0
                 if fx_type == "ding":
                     if fx_qj == Config.FX_QJ_CK.value:
@@ -337,30 +370,98 @@ class CL(ICL):
                 self.fxs.append(fx)
 
     def check_bi_valid(self, start_fx: FX, end_fx: FX, bi_type: str) -> bool:
+        # 顶底必须交替
         if start_fx.type == end_fx.type:
             return False
-        
-        k_diff = abs(end_fx.k.index - start_fx.k.index)
-        is_valid = True
-        
+
+        # 方向必须满足：顶->低 新低；底->顶 新高
+        if start_fx.type == "ding" and end_fx.val >= start_fx.val:
+            return False
+        if start_fx.type == "di" and end_fx.val <= start_fx.val:
+            return False
+
+        # 缠论K线中心索引差值（用于判断是否存在独立缠论K线）
+        ck_diff = end_fx.k.index - start_fx.k.index
+
+        # 原始K线数量（用于新笔/简单笔判断）
+        src_k_num = 0
+        for ck in self.cl_klines[start_fx.k.index : end_fx.k.index + 1]:
+            src_k_num += len(ck.klines)
+
         if bi_type == Config.BI_TYPE_OLD.value:
-            if k_diff < 4: is_valid = False
+            # 老笔：分型不共用缠论K线，分型之间至少有一根独立缠论K线
+            return ck_diff >= 2
         elif bi_type == Config.BI_TYPE_NEW.value:
-            if k_diff < 3: is_valid = False
+            # 新笔：分型之间至少5根原始K线，且不共用缠论K线（至少一根独立缠论K线）
+            return src_k_num >= 5 and ck_diff >= 2
         elif bi_type == Config.BI_TYPE_JDB.value:
-            if k_diff < 3: is_valid = False
+            # 简单笔：至少5根原始K线即可
+            return src_k_num >= 5
+        elif bi_type == Config.BI_TYPE_DD.value:
+            # 顶底成笔：出现相邻顶底即可
+            return True
         else:
-            if k_diff < 4: is_valid = False
+            return ck_diff >= 2
+
+    def _bi_high_low(self, start_fx: FX, end_fx: FX) -> Tuple[float, float]:
+        qy = self.config.get("fx_qy", Config.FX_QY_THREE.value)
+        qj_ck = Config.FX_QJ_CK.value
+        qj_k = Config.FX_QJ_K.value
+        bi_qj = self.config.get("bi_qj", Config.BI_QJ_DD.value)
+        if bi_qj == Config.BI_QJ_DD.value:
+            high = max(start_fx.val, end_fx.val)
+            low = min(start_fx.val, end_fx.val)
+        elif bi_qj == Config.BI_QJ_CK.value:
+            high = max(start_fx.high(qj_ck, qy), end_fx.high(qj_ck, qy))
+            low = min(start_fx.low(qj_ck, qy), end_fx.low(qj_ck, qy))
+        elif bi_qj == Config.BI_QJ_K.value:
+            high = max(start_fx.high(qj_k, qy), end_fx.high(qj_k, qy))
+            low = min(start_fx.low(qj_k, qy), end_fx.low(qj_k, qy))
+        else:
+            high = max(start_fx.val, end_fx.val)
+            low = min(start_fx.val, end_fx.val)
+        return high, low
+
+    def _process_fx_klines(self, klines, fx_bh):
+        """分型级别的K线包含处理方法"""
+        if fx_bh == "fx_bh_no":
+            return klines  # 不进行包含处理
+        
+        processed = []
+        for k in klines:
+            if not processed:
+                processed.append(k)
+                continue
+                
+            last = processed[-1]
+            # 包含关系判断
+            is_included = (k.h >= last.h and k.l <= last.l) or (last.h >= k.h and last.l <= k.l)
             
-        if is_valid:
-            if start_fx.type == "ding" and end_fx.val >= start_fx.val: is_valid = False
-            if start_fx.type == "di" and end_fx.val <= start_fx.val: is_valid = False
-            
-            # 检查是否满足 配置的 笔最小K线数量
-            if k_diff < self.config.get("bi_min_k_num", 0):
-                 is_valid = False
-                 
-        return is_valid
+            if is_included:
+                # 标记被包含的K线
+                k._is_included = True
+                
+                # 包含处理：根据趋势方向
+                if fx_bh == "fx_bh_dingdi":
+                    # 顶底分型分别处理 - 简化版本
+                    last.h = max(last.h, k.h)
+                    last.l = min(last.l, k.l)
+                else:
+                    # 标准包含处理：根据收盘价决定方向
+                    if k.c > last.c:
+                        # 向上处理：取高高
+                        last.h = max(last.h, k.h)
+                        last.l = max(last.l, k.l)
+                    else:
+                        # 向下处理：取低低
+                        last.h = min(last.h, k.h)
+                        last.l = min(last.l, k.l)
+                last.klines.extend(k.klines)
+                last.n += getattr(k, 'n', 1)
+            else:
+                processed.append(k)
+        
+        return processed
 
     def _cal_bi(self):
         self.bis = []
@@ -383,8 +484,7 @@ class CL(ICL):
                     _type="down" if start_fx.type == "ding" else "up",
                     index=len(self.bis)
                 )
-                bi.high = max(start_fx.val, end_fx.val)
-                bi.low = min(start_fx.val, end_fx.val)
+                bi.high, bi.low = self._bi_high_low(start_fx, end_fx)
                 self.bis.append(bi)
                 break
             
@@ -424,8 +524,7 @@ class CL(ICL):
                 if updated:
                     # Extend the last pen
                     last_bi.end = next_fx
-                    last_bi.high = max(last_bi.start.val, next_fx.val)
-                    last_bi.low = min(last_bi.start.val, next_fx.val)
+                    last_bi.high, last_bi.low = self._bi_high_low(last_bi.start, next_fx)
                     # Note: We do not add a new pen. We modified the existing one.
                 
                 curr_fx_idx += 1
@@ -439,8 +538,7 @@ class CL(ICL):
                     _type="down" if start_fx.type == "ding" else "up",
                     index=len(self.bis)
                 )
-                bi.high = max(start_fx.val, next_fx.val)
-                bi.low = min(start_fx.val, next_fx.val)
+                bi.high, bi.low = self._bi_high_low(start_fx, next_fx)
                 self.bis.append(bi)
             else:
                 # Invalid New Pen.
@@ -454,255 +552,228 @@ class CL(ICL):
         if len(self.bis) < 3:
             return
 
-        # 线段划分 - 特征序列法
-        current_xd_start_index = 0
-        
-        while current_xd_start_index < len(self.bis):
-            # Determine assumed direction for the current segment
-            if current_xd_start_index >= len(self.bis):
-                break
-            start_bi = self.bis[current_xd_start_index]
-            # Segment direction is same as first stroke direction
-            xd_direction = start_bi.type
+        # 配置：是否允许笔破坏
+        allow_bi_pohuai = self.config.get("xd_allow_bi_pohuai", "yes")
 
-            # 收集特征序列（同向笔）
-            feature_seq_bis = []
-            tzxls = []
-            end_index = -1
-            found_fractal = False
-            
-            # 从当前线段开始的笔向后遍历
-            # 标准特征序列：
-            # 向上线段（特征序列为向下笔）：寻找顶分型
-            # 向下线段（特征序列为向上笔）：寻找底分型
-            
-            # Determine feature sequence direction
-            # If current segment is Up, we look for Down strokes to form the Standard Feature Sequence?
-            # Actually, standard Chanlun uses:
-            # Up Segment: Feature Sequence = Down Strokes (S2, S4, S6...)
-            # Down Segment: Feature Sequence = Up Strokes (S2, S4, S6...)
-            # Wait, if we are in an Up Segment, we are looking for the End Point (Top).
-            # The Top is determined by the Feature Sequence of Down Strokes?
-            # No, the Feature Sequence constructs a "Virtual K-Line" system.
-            # If Up Segment, we take Down Strokes.
-            # If these Down Strokes form a Top Fractal (in the virtual sense, meaning Higher Highs then Lower Highs? No).
-            # Top Fractal in Down Strokes? That sounds weird.
-            # Let's check standard definition:
-            # "在标准特征序列里，构成分型的三个相邻元素，只有两种情况：
-            # 1. 第一和第二元素间存在缺口...
-            # 2. ...不存在缺口"
-            # "对于向上线段，特征序列是向下的笔；对于向下线段，特征序列是向上的笔"
-            # And we look for Top Fractal (for Up Segment end) or Bottom Fractal (for Down Segment end)?
-            # Yes.
-            # So, if Up Segment -> Collection of Down Strokes.
-            # We check if these Down Strokes form a Top Fractal?
-            # A Top Fractal means: Middle Element is Highest.
-            # But Down Strokes represent "Pullbacks".
-            # If we have Pullback 1 (High1, Low1), Pullback 2 (High2, Low2), Pullback 3.
-            # If Pullback 2 is "Higher" than 1 and 3?
-            # For Down Strokes, "Higher" means what?
-            # Usually Feature Elements are treated as K-Lines.
-            # Up Segment End = Top Fractal of Feature Sequence.
-            # Feature Sequence = Down Strokes.
-            # So we treat Down Strokes as K-Lines (High, Low).
-            # And find Top Fractal (High of S2 > High of S1 & S3).
-            
-            feature_dir = "down" if xd_direction == "up" else "up"
-            
-            for i in range(current_xd_start_index + 1, len(self.bis)):
+        start_idx = 0
+        while start_idx <= len(self.bis) - 3:
+            # 1. 检查起始三笔是否有重叠 (线段定义的必要条件)
+            bi1, bi2, bi3 = self.bis[start_idx], self.bis[start_idx+1], self.bis[start_idx+2]
+            if not (max(bi1.low, bi2.low, bi3.low) < min(bi1.high, bi2.high, bi3.high)):
+                start_idx += 1
+                continue
+
+            start_bi = self.bis[start_idx]
+            xd_dir = start_bi.type
+            feature_dir = "down" if xd_dir == "up" else "up"
+            tzxls: List[TZXL] = []
+            made = False
+            last_same = start_bi
+
+            # 笔破坏检查
+            bi_pohuai_done = False
+
+            for i in range(start_idx + 1, len(self.bis)):
                 bi = self.bis[i]
                 
-                if bi.type == feature_dir:
-                    # Create TZXL (Feature Element)
-                    current_tzxl = TZXL(
-                        bh_direction=feature_dir,
-                        line=bi,
-                        pre_line=None,
-                        line_bad=False,
-                        done=True
-                    )
-                    # Copy High/Low from bi
-                    current_tzxl.max = bi.high
-                    current_tzxl.min = bi.low
-                    current_tzxl.lines = [bi]
-                    
-                    # Inclusion Handling
-                    if len(tzxls) > 0:
-                        last_tzxl = tzxls[-1]
+                # 笔破坏判断 (标准线段被第一笔反向笔直接破坏)
+                if allow_bi_pohuai == "yes" and not bi_pohuai_done:
+                    # 必须是特征序列方向的笔 (反向笔)
+                    if bi.type == feature_dir:
+                        pohuai = False
+                        if xd_dir == "up" and bi.low < start_bi.low:
+                            pohuai = True
+                        elif xd_dir == "down" and bi.high > start_bi.high:
+                            pohuai = True
                         
-                        # Standard Feature Sequence Inclusion Rule:
-                        # Up Segment (Feature Dir = Down):
-                        #   We are looking for Top Fractal.
-                        #   Inclusion Direction is Up? No.
-                        #   "特征序列的包含关系处理... 向上线段... 按照向上处理?"
-                        #   Standard: In Up Segment, Feature Sequence (Down Strokes) uses UPWARD inclusion?
-                        #   Let's verify.
-                        #   If we are finding the Top, we want to push the peak higher?
-                        #   Actually, standard text says:
-                        #   "向上线段... 特征序列... 包含关系... 按照向上的顺序处理" (Standard 108 Lesson)
-                        #   So if Up Segment -> Inclusion Up.
-                        #   If Down Segment -> Inclusion Down.
-                        
-                        inclusion_dir = xd_direction # 'up' or 'down'
-                        
-                        is_included = False
-                        if (current_tzxl.max <= last_tzxl.max and current_tzxl.min >= last_tzxl.min) or \
-                           (last_tzxl.max <= current_tzxl.max and last_tzxl.min >= current_tzxl.min):
-                            is_included = True
-                            
-                        if is_included:
-                            if inclusion_dir == "up":
-                                # Up Inclusion: High = Max, Low = Max
-                                last_tzxl.max = max(last_tzxl.max, current_tzxl.max)
-                                last_tzxl.min = max(last_tzxl.min, current_tzxl.min)
+                        if pohuai:
+                            # 发生笔破坏，线段直接结束
+                            xd = XD(start_bi.start, bi.end, start_bi, bi, xd_dir, None, None, len(self.xds))
+                            if xd_dir == "up":
+                                xd.high = start_bi.high # 笔破坏通常只有第一笔
+                                xd.low = bi.low
                             else:
-                                # Down Inclusion: High = Min, Low = Min
-                                last_tzxl.max = min(last_tzxl.max, current_tzxl.max)
-                                last_tzxl.min = min(last_tzxl.min, current_tzxl.min)
+                                xd.high = bi.high
+                                xd.low = start_bi.low
+                            xd.done = True
+                            # 标记为笔破坏
+                            xd.is_split = "bi_pohuai"
+                            self.xds.append(xd)
                             
-                            # Append lines
-                            last_tzxl.lines.append(bi)
-                            # Update representative line?
-                            # Usually we keep the one that signifies the extreme.
-                            # But for Feature Sequence, it's a merged element.
-                            # We keep the list.
+                            made = True
+                            start_idx = i 
+                            bi_pohuai_done = True # 标记已处理
+                            break
+
+                if bi.type == xd_dir:
+                    last_same = bi
+                if bi.type != feature_dir:
+                    continue
+
+                # 特征序列元素
+                tz = TZXL(feature_dir, bi, None, False, True)
+                tz.max = bi.high
+                tz.min = bi.low
+                tz.lines = [bi]
+
+                # 特征序列包含处理
+                if tzxls:
+                    last = tzxls[-1]
+                    # 包含关系判断：tz 在 last 中，或者 last 在 tz 中
+                    inc = (tz.max <= last.max and tz.min >= last.min) or (last.max <= tz.max and last.min >= tz.min)
+                    if inc:
+                        # 包含处理方向：取决于线段方向
+                        # 向上线段 (xd_dir='up')，特征序列是向下的笔，但包含处理方向与线段方向相同（向上处理，取高高）
+                        if xd_dir == "up":
+                            last.max = max(last.max, tz.max)
+                            last.min = max(last.min, tz.min)
                         else:
-                            tzxls.append(current_tzxl)
+                            # 向下线段：特征序列向上笔，但包含处理方向与线段方向相同（向下处理，取低低）
+                            last.max = min(last.max, tz.max)
+                            last.min = min(last.min, tz.min)
+                        last.lines.append(bi)
                     else:
-                        tzxls.append(current_tzxl)
-                        
-                    # Check for Fractal (FenXing)
-                    # We need 3 non-included elements
-                    if len(tzxls) >= 3:
-                        t1 = tzxls[-3]
-                        t2 = tzxls[-2]
-                        t3 = tzxls[-1]
-                        
-                        is_fractal = False
-                        if xd_direction == "up":
-                            # Up Segment -> Look for Top Fractal in Feature Sequence
-                            # Top Fractal: t2.max > t1.max and t2.max > t3.max
-                            # (Strictly speaking, also t2.min?)
-                            # Standard Top FX: High2 is highest.
-                            if t2.max > t1.max and t2.max > t3.max:
-                                is_fractal = True
+                        tzxls.append(tz)
+                else:
+                    tzxls.append(tz)
+
+                # 检查特征序列分型
+                if len(tzxls) >= 3:
+                    t1, t2, t3 = tzxls[-3], tzxls[-2], tzxls[-1]
+                    
+                    # 分型判断
+                    is_fx = False
+                    if xd_dir == "up":
+                        # 向上线段，找特征序列的顶分型 (因为特征序列是向下笔，趋势是上升的? 不，特征序列是向下笔，如果趋势向上，它们应该是一底比一底高。如果出现顶分型，说明底不再抬高，反而降低)
+                        # 修正：向上线段，特征序列为向下笔。正常延伸时，向下笔的低点应该不断抬高？不对。
+                        # 向上线段：笔是 上、下、上、下...
+                        # 特征序列（下笔）：下1、下2、下3...
+                        # 如果线段延伸，下2应该比下1高（即下2的底 > 下1的底？或者下2的顶 > 下1的顶？）
+                        # 标准定义：向上线段，特征序列（下笔）的区间应该是“向上”的。即 T2 > T1.
+                        # 如果出现顶分型 (T2 > T1 且 T2 > T3)，说明“向上”趋势终结。
+                        # 所以找顶分型是对的。
+                        if t2.max >= t1.max and t2.max >= t3.max:
+                            is_fx = True
+                    else:
+                        # 向下线段，找特征序列的底分型
+                        if t2.min <= t1.min and t2.min <= t3.min:
+                            is_fx = True
+                    
+                    if is_fx:
+                        # 缺口判断 (第一元素与第二元素)
+                        has_gap = False
+                        if xd_dir == "up":
+                            # 向上线段，特征序列顶分型
+                            # 缺口：T2 与 T1 之间没有重叠。因为是向上趋势，T2 应该在 T1 之上。
+                            # 如果 T2.min > T1.max，则为缺口
+                            if t2.min > t1.max: has_gap = True
                         else:
-                            # Down Segment -> Look for Bottom Fractal in Feature Sequence
-                            # Bottom Fractal: t2.min < t1.min and t2.min < t3.min
-                            if t2.min < t1.min and t2.min < t3.min:
-                                is_fractal = True
-                                
-                        if is_fractal:
-                            # Found Segment End!
-                            # The End Point is the Peak of the Segment.
-                            # In Up Segment, the Feature Sequence are Down Strokes.
-                            # t2 is the Peak Down Stroke?
-                            # No, t2 is the Down Stroke that STARTS from the Peak.
-                            # Wait.
-                            # Up Segment: B1(Up), B2(Down), B3(Up), B4(Down)...
-                            # Feature Seq: B2, B4...
-                            # If B4 is Top Fractal?
-                            # B4 > B2 and B4 > B6?
-                            # That means B4 is "Higher" than B2 and B6.
-                            # B4 is a Down Stroke. Its "High" is the start point (Peak).
-                            # So B4 starting higher means the Peak is higher.
-                            # So Top Fractal in Down Strokes means Local Maxima of Peaks.
-                            # Yes.
-                            # So the Segment End is the START of t2.line.
-                            # t2 is a Down Stroke (in Up Segment).
-                            # Its start point is the Peak.
-                            # So Segment Ends at t2.line.start.
-                            # Which corresponds to the END of the previous Up Stroke.
-                            
-                            # Let's trace back the strokes.
-                            # t2.line is the Down Stroke.
-                            # The Segment ends at t2.line.start.
-                            # The actual Segment object should cover from Current_Start to t2.line.start.
-                            
-                            # BUT, Chanlun definition: "线段的终点是特征序列顶分型的顶"
-                            # Feature Sequence Element t2.
-                            # Its "Top" (High) is t2.max.
-                            # Is t2.max the value or the point?
-                            # It is the value.
-                            # The point is t2.line.start (for Down Stroke).
-                            
-                            # So End Line?
-                            # The segment consists of Bi.
-                            # Ends at the Bi that creates the peak.
-                            # That is the Bi BEFORE t2.line.
-                            
-                            # Get the actual Bi list index of t2.line
-                            # t2 might be merged.
-                            # If merged, t2.line is the representative?
-                            # We need the Bi that actually touches the peak.
-                            # For Up Segment (Down Feature), the peak is the High of the stroke.
-                            # If merged (Up Inclusion), we took Max High.
-                            # So we need the line with Max High in t2.lines.
-                            
-                            peak_line = None
-                            if xd_direction == "up":
-                                # Find line with Max High in t2.lines
-                                peak_line = max(t2.lines, key=lambda b: b.high)
-                                # The segment ends at peak_line.start?
-                                # No, peak_line is a Down Stroke.
-                                # It starts at the Peak.
-                                # So the Up Segment ends at peak_line.start.
-                                # The Last Stroke of the Up Segment is the Up Stroke BEFORE peak_line.
-                                # Let's find it.
-                                # It is self.bis[peak_line.index - 1].
-                                end_bi_idx = peak_line.index - 1
+                            # 向下线段，特征序列底分型
+                            # 缺口：T2 在 T1 之下。
+                            # 如果 T2.max < T1.min，则为缺口
+                            if t2.max < t1.min: has_gap = True
+
+                        # 线段结束确认 (参照开发指南.md)
+                        is_valid = False
+                        
+                        # 1. 基础分型有效
+                        
+                        # 2. 破坏确认 (t3 必须突破 t1 的极值)
+                        # 向上线段(找顶分型): T3 必须跌破 T1 的底 (T3.low < T1.low) ?
+                        # 开发指南: "return third['low'] < first['low']" (for Up Segment)
+                        # 向下线段(找底分型): T3 必须升破 T1 的顶 (T3.high > T1.high)
+                        
+                        break_condition = False
+                        if xd_dir == "up":
+                             if t3.min < t1.min: break_condition = True
+                        else:
+                             if t3.max > t1.max: break_condition = True
+                             
+                        # 3. 缺口特殊处理
+                        # 如果有缺口，必须满足 break_condition (其实标准缠论中，有缺口即为“第二种破坏”，通常需要确认)
+                        # 如果无缺口，也建议满足 break_condition 以过滤假突破
+                        
+                        if has_gap:
+                            # 有缺口，必须强力确认 (即 T3 至少要回补缺口，甚至突破 T1)
+                            # 原代码逻辑：T3 回补缺口即可 (T3.min <= T1.max for UP)
+                            # 开发指南逻辑：似乎更严格
+                            # 采用折中方案：必须满足 break_condition
+                            if break_condition: is_valid = True
+                        else:
+                            # 无缺口，标准分型
+                            # 是否强制要求 break_condition? 
+                            # 严格缠论中，无缺口的分型直接成立。但为了过滤震荡，加上 break_condition 会更稳健。
+                            # 原代码没有 break_condition。
+                            # 依据开发指南，加上。
+                            if break_condition: is_valid = True
+                            # 如果不加 break_condition，可能会在震荡中频繁切断。
+                            # 但如果严格按照缠论，“顶分型无缺口”即成立。
+                            # 考虑到“开发指南”特别提到了 verify_fractals 和 check_break_condition，我们加上它。
+                            # 如果不想太严格，可以保留原代码的“无缺口即成立”。
+                            # 这里遵循“修正”指令，倾向于更准确/严格的实现。
+                            pass
+
+                        if is_valid:
+                            # 找到分型顶点对应的笔
+                            # t2 包含的笔中，极值笔
+                            if xd_dir == "up":
+                                peak = max(t2.lines, key=lambda b: b.high)
+                                fx_obj = XLFX("ding", t2, [t1, t2, t3], True)
                             else:
-                                # Down Segment. Feature = Up Strokes.
-                                # Look for Bottom Fractal.
-                                # t2.min is lowest.
-                                # Find line with Min Low in t2.lines.
-                                peak_line = min(t2.lines, key=lambda b: b.low)
-                                # peak_line is an Up Stroke.
-                                # It starts at the Bottom.
-                                # So Down Segment ends at peak_line.start.
-                                # Last Stroke is Down Stroke before peak_line.
-                                end_bi_idx = peak_line.index - 1
-                                
-                            if end_bi_idx < current_xd_start_index + 2:
-                                # Not enough strokes (min 3 strokes: Start, Op, End)
-                                # Continue searching
-                                continue
-                                
-                            end_bi = self.bis[end_bi_idx]
+                                peak = min(t2.lines, key=lambda b: b.low)
+                                fx_obj = XLFX("di", t2, [t1, t2, t3], True)
+                            # 记录缺口与形态信息
+                            fx_obj.qk = has_gap
+                            fx_obj.is_line_bad = False
+
+                            end_idx = peak.index
+                            end_bi = self.bis[end_idx]
                             
-                            # Construct XD
+                            # 创建线段
                             xd = XD(
-                                start=start_bi.start,
-                                end=end_bi.end,
-                                start_line=start_bi,
-                                end_line=end_bi,
-                                _type=xd_direction,
-                                index=len(self.xds)
+                                start_bi.start,
+                                end_bi.end,
+                                start_bi,
+                                end_bi,
+                                xd_dir,
+                                fx_obj if xd_dir == "up" else None,
+                                fx_obj if xd_dir == "down" else None,
+                                len(self.xds),
                             )
-                            
-                            # High/Low
-                            # segment_bis = self.bis[current_xd_start_index : end_bi_idx + 1]
-                            # xd.high = max([b.high for b in segment_bis])
-                            # xd.low = min([b.low for b in segment_bis])
-                            # Use peak value directly
-                            if xd_direction == "up":
-                                xd.high = end_bi.end.val # Peak
-                                xd.low = start_bi.start.val # Start
+                            if xd_dir == "up":
+                                xd.high = end_bi.end.val
+                                xd.low = start_bi.start.val
                             else:
                                 xd.high = start_bi.start.val
                                 xd.low = end_bi.end.val
-                                
+                            xd.done = True
                             self.xds.append(xd)
-                            found_fractal = True
                             
-                            # Next segment starts from the stroke AFTER end_bi?
-                            # The stroke AFTER end_bi is `peak_line` (the first stroke of next segment).
-                            # So next index = peak_line.index
-                            current_xd_start_index = peak_line.index
+                            made = True
+                            start_idx = peak.index # 下一段从峰值笔开始
                             break
             
-            if not found_fractal:
-                break
+            if bi_pohuai_done:
+                continue
+
+            if not made:
+                # 生成未完成线段（到当前同向最后一笔）
+                if last_same.index > start_bi.index + 1:
+                    xd = XD(start_bi.start, last_same.end, start_bi, last_same, xd_dir, None, None, len(self.xds))
+                    if xd_dir == "up":
+                        xd.high = last_same.end.val
+                        xd.low = start_bi.start.val
+                    else:
+                        xd.high = start_bi.start.val
+                        xd.low = last_same.end.val
+                    xd.done = False
+                    self.xds.append(xd)
+                    # 结束所有计算，因为已经到了最后
+                    break
+                else:
+                    # 无法构成线段 (如笔数不足)，尝试下一个笔作为起点
+                    start_idx += 1
+
 
     def _cal_zsd(self):
         self.zsds = self.xds
@@ -711,125 +782,102 @@ class CL(ICL):
         # Clear existing ZSs
         self.bi_zss = {}
         self.xd_zss = {}
-        
-        # --- Calculate Stroke Pivots (BI ZS) ---
-        zs_bi_types = self.config.get("zs_bi_type", [])
-        # Ensure it is a list
-        if not isinstance(zs_bi_types, list):
-            zs_bi_types = [zs_bi_types]
-            
-        for zs_type in zs_bi_types:
-            self.bi_zss[zs_type] = []
-            lines = self.bis
-            if len(lines) < 3:
-                continue
-                
+
+        # Helper: 以三线重叠计算中枢，并向后延伸直到离开（含离开段）
+        def _calc_zss_by_lines(_lines: List[LINE], _zs_type: str) -> List[ZS]:
+            zss: List[ZS] = []
+            if len(_lines) < 3:
+                return zss
             i = 0
-            while i <= len(lines) - 3:
-                b1 = lines[i]
-                b2 = lines[i+1]
-                b3 = lines[i+2]
-                
-                # Pivot Definition: Overlap of 3 consecutive lines
-                # ZG = min(Highs)
-                # ZD = max(Lows)
-                zg = min(b1.high, b2.high, b3.high)
-                zd = max(b1.low, b2.low, b3.low)
-                
-                # Check if valid pivot (ZG > ZD)
+            while i <= len(_lines) - 3:
+                l1, l2, l3 = _lines[i], _lines[i + 1], _lines[i + 2]
+                zg = min(l1.high, l2.high, l3.high)
+                zd = max(l1.low, l2.low, l3.low)
                 if zg > zd:
                     zs = ZS(
-                        zs_type=zs_type,
-                        start=b1.start,
-                        end=b3.end,
+                        zs_type=_zs_type,
+                        start=l1.start,
+                        end=l3.end,
                         zg=zg,
                         zd=zd,
-                        gg=max(b1.high, b2.high, b3.high),
-                        dd=min(b1.low, b2.low, b3.low),
-                        index=len(self.bi_zss[zs_type]),
+                        gg=max(l1.high, l2.high, l3.high),
+                        dd=min(l1.low, l2.low, l3.low),
+                        index=len(zss),
                         line_num=3,
-                        _type="up" if b1.type == "down" else "down"
+                        _type="up" if l1.type == "down" else "down",
                     )
-                    zs.lines = [b1, b2, b3]
+                    zs.lines = [l1, l2, l3]
                     zs.real = True
-                    self.bi_zss[zs_type].append(zs)
-                    
-                    # Extension: Add subsequent lines if they overlap with [ZD, ZG]
                     j = i + 3
-                    while j < len(lines):
-                        bn = lines[j]
-                        # Check overlap: Not (High < ZD or Low > ZG)
-                        if not (bn.high < zd or bn.low > zg):
-                            zs.lines.append(bn)
-                            zs.end = bn.end
-                            # Update GG/DD (Highest/Lowest of the whole pivot oscillation)
-                            if bn.high > zs.gg: zs.gg = bn.high
-                            if bn.low < zs.dd: zs.dd = bn.low
+                    # 段内延伸（含离开段）
+                    while j < len(_lines):
+                        ln = _lines[j]
+                        if not (ln.high < zd or ln.low > zg):
+                            zs.lines.append(ln)
+                            zs.end = ln.end
+                            if ln.high > zs.gg:
+                                zs.gg = ln.high
+                            if ln.low < zs.dd:
+                                zs.dd = ln.low
                             j += 1
                         else:
+                            zs.lines.append(ln)  # 计入离开段以确定右边界
+                            zs.end = ln.end
+                            if ln.high > zs.gg:
+                                zs.gg = ln.high
+                            if ln.low < zs.dd:
+                                zs.dd = ln.low
+                            j += 1
                             break
-                    # Continue checking from the last line of the pivot?
-                    # Standard practice: A line can be reused as the start of a new pivot if it's a "connector"?
-                    # But usually, pivots are distinct structures.
-                    # If we have A-B-C-D-E forming a pivot.
-                    # Next structure starts after E? Or from E?
-                    # If E is the leaving stroke, the next potential pivot starts from E (as the first stroke)?
-                    # Yes, E is the first stroke of the next potential pattern.
-                    i = j - 1 
+                    zss.append(zs)
+                    i = j - 1
                 else:
                     i += 1
+            return zss
 
-        # --- Calculate Segment Pivots (XD ZS) ---
+        # --- 计算笔中枢（支持标准/段内） ---
+        zs_bi_types = self.config.get("zs_bi_type", [])
+        if not isinstance(zs_bi_types, list):
+            zs_bi_types = [zs_bi_types]
+
+        for zs_type in zs_bi_types:
+            self.bi_zss[zs_type] = []
+            if len(self.bis) < 3:
+                continue
+
+            if zs_type == Config.ZS_TYPE_DN.value and len(self.xds) > 0:
+                # 段内中枢：每个线段内独立计算中枢，从线段起点开始重算
+                for xd in self.xds:
+                    start_idx = xd.start_line.index
+                    end_idx = xd.end_line.index if xd.end_line is not None else self.bis[-1].index
+                    sub_lines = [bi for bi in self.bis if start_idx <= bi.index <= end_idx]
+                    if len(sub_lines) < 3:
+                        continue
+                    zss_dn = _calc_zss_by_lines(sub_lines, zs_type)
+                    # 修正中枢索引为全局顺序
+                    for zs in zss_dn:
+                        zs.index = len(self.bi_zss[zs_type])
+                        self.bi_zss[zs_type].append(zs)
+            else:
+                # 标准中枢/其他类型：在全体笔上计算
+                self.bi_zss[zs_type] = _calc_zss_by_lines(self.bis, zs_type)
+
+        # --- 计算线段中枢（支持标准/段内） ---
         zs_xd_types = self.config.get("zs_xd_type", [])
         if not isinstance(zs_xd_types, list):
             zs_xd_types = [zs_xd_types]
 
         for zs_xd_type in zs_xd_types:
             self.xd_zss[zs_xd_type] = []
-            lines = self.xds
-            if len(lines) < 3:
+            if len(self.xds) < 3:
                 continue
 
-            i = 0
-            while i <= len(lines) - 3:
-                x1 = lines[i]
-                x2 = lines[i+1]
-                x3 = lines[i+2]
-
-                zg = min(x1.high, x2.high, x3.high)
-                zd = max(x1.low, x2.low, x3.low)
-
-                if zg > zd:
-                    zs = ZS(
-                        zs_type=zs_xd_type,
-                        start=x1.start,
-                        end=x3.end,
-                        zg=zg,
-                        zd=zd,
-                        gg=max(x1.high, x2.high, x3.high),
-                        dd=min(x1.low, x2.low, x3.low),
-                        index=len(self.xd_zss[zs_xd_type]),
-                        line_num=3,
-                        _type="up" if x1.type == "down" else "down"
-                    )
-                    zs.lines = [x1, x2, x3]
-                    zs.real = True
-                    self.xd_zss[zs_xd_type].append(zs)
-
-                    j = i + 3
-                    while j < len(lines):
-                        xn = lines[j]
-                        if not (xn.high < zd or xn.low > zg):
-                            zs.lines.append(xn)
-                            zs.end = xn.end
-                            if xn.high > zs.gg: zs.gg = xn.high
-                            if xn.low < zs.dd: zs.dd = xn.low
-                            j += 1
-                        else:
-                            break
-                    i = j - 1
-                else:
-                    i += 1
+            if zs_xd_type == Config.ZS_TYPE_DN.value:
+                # 段内中枢：按走势段内线段进行局部计算（此处线段本身已是特征序列产物，直接全量计算即可）
+                self.xd_zss[zs_xd_type] = _calc_zss_by_lines(self.xds, zs_xd_type)
+            else:
+                # 标准中枢/其他类型：同样按全量线段计算
+                self.xd_zss[zs_xd_type] = _calc_zss_by_lines(self.xds, zs_xd_type)
 
     def _cal_mmd_bc(self):
         # Calculate MACD LD (Force) and Check BC (Divergence)
@@ -839,8 +887,28 @@ class CL(ICL):
         zs_type = self.config.get("zs_bi_type", ["common"])[0]
         zss = self.bi_zss.get(zs_type, [])
         
+        # Configuration flags for Buy/Sell Points
+        check_1buy = self.config.get("mmd_1buy_bc", True)
+        check_1sell = self.config.get("mmd_1sell_bc", True)
+        check_2buy = self.config.get("mmd_2buy_bc", True)
+        check_2sell = self.config.get("mmd_2sell_bc", True)
+        check_3buy = self.config.get("mmd_3buy_bc", True)
+        check_3sell = self.config.get("mmd_3sell_bc", True)
+        check_l2buy = self.config.get("mmd_l2buy_bc", True)
+        check_l2sell = self.config.get("mmd_l2sell_bc", True)
+        check_l3buy = self.config.get("mmd_l3buy_bc", True)
+        check_l3sell = self.config.get("mmd_l3sell_bc", True)
+
         for i in range(len(self.bis)):
             bi = self.bis[i]
+            if i >= 2:
+                _window = self.bis[: i + 1]
+                try:
+                    _hist_bc, _deadif_bc = cal_macd_bis_is_bc(_window, self)
+                except Exception:
+                    _hist_bc, _deadif_bc = (False, False)
+                if _hist_bc or _deadif_bc:
+                    bi.add_bc("bi", None, self.bis[i-2], [self.bis[i-2]], True, zs_type)
             
             # A. Calculate MACD LD
             # (Already handled by get_ld internally or we assume it's available)
@@ -852,10 +920,6 @@ class CL(ICL):
                     ld1 = bi.get_ld(self)["macd"]
                     ld2 = prev_bi.get_ld(self)["macd"]
                     
-                    # Debug print (remove later)
-                    # if i < 10:
-                    #    print(f"BI {i} ({bi.type}) LD: {ld1['hist']['sum']} vs Prev: {ld2['hist']['sum']}")
-
                     if compare_ld_beichi(ld2, ld1, bi.type):
                         # Check if it makes a new High/Low
                         if (bi.type == "up" and bi.high > prev_bi.high) or \
@@ -867,10 +931,6 @@ class CL(ICL):
             # Check if bi is associated with any ZS logic
             for zs in zss:
                 # Only consider pivots that are "finished" or relevant
-                # A pivot is finished when the next stroke leaves it?
-                # Or we check relation to all pivots?
-                # Standard: Check relation to the LAST pivot or RELEVANT pivot.
-                # Here we iterate all, but should filter by time/index.
                 if not zs.real: continue
                 
                 # PZ (Consolidation Divergence)
@@ -881,59 +941,27 @@ class CL(ICL):
                 
                 # QS (Trend Divergence)
                 # Check if 'bi' is the end of a trend relative to 'zs'
-                # Need to check trend structure (at least 2 pivots)
                 is_qs, compare_lines = self.beichi_qs(self.bis, zss, bi)
                 if is_qs:
                      # Ensure the divergence is related to THIS zs (last pivot of trend)
-                     # beichi_qs should return the ZS it compared against?
-                     # Or we assume 'zs' is the last one?
-                     # The function `beichi_qs` iterates ZSs internally or uses the list?
-                     # Let's look at `beichi_qs` implementation (not shown here but assumed).
-                     # If `beichi_qs` checks GLOBAL trend, it might return True for the last ZS.
-                     # We should probably pass `zs` to it or verify `zs` is the last one.
-                     # Assuming `beichi_qs` returns True if `bi` is trend divergence
-                     # AND `zs` is the reference pivot.
-                     # Actually, `beichi_qs` usually finds the last 2 pivots.
-                     # If `zs` is the last pivot of the trend ending at `bi`.
                      if zs.lines[-1].index < bi.index: # ZS must be before BI
                          bi.add_bc("qs", zs, None, compare_lines, True, zs_type)
                 
                 # 3rd Buy/Sell
-                # 3rd Buy: Upward ZS, Leaving Stroke (Up), Pullback (Down) doesn't touch ZG.
-                # 3rd Sell: Downward ZS, Leaving Stroke (Down), Pullback (Up) doesn't touch ZD.
-                # We need to identify:
-                # 1. Leaving Stroke (bi-2 or earlier?)
-                # 2. Pullback Stroke (bi)
-                # Check if 'bi' is a pullback after leaving 'zs'
-                # Condition: 
-                # - 'bi' is the stroke immediately following the Leaving Stroke?
-                # - Or subsequent stroke? Standard: Immediate pullback.
-                
-                # We check if prev_bi (i-1) was the Leaving Stroke
                 if i >= 1:
                     prev_bi = self.bis[i-1]
-                    # Is prev_bi the leaving stroke of ZS?
-                    # Leaving stroke starts at zs.end
                     if prev_bi.start.index == zs.end.index:
-                        # Check 3rd Buy (ZS Up, Leaving Up, Pullback Down > ZG)
-                        # Wait, ZS direction doesn't strictly matter, but relative position does.
-                        # If Leaving Up -> Pullback Down.
-                        # If Pullback Low > ZG -> 3rd Buy.
-                        if bi.type == "down" and bi.low > zs.zg:
-                            # Mark 3buy
+                        # Check 3rd Buy
+                        if check_3buy and bi.type == "down" and bi.low > zs.zg:
                              if not any(m.name == "3buy" and m.zs.index == zs.index for m in bi.mmds):
                                  bi.add_mmd("3buy", zs, zs_type)
                         
-                        # Check 3rd Sell (ZS Down?, Leaving Down, Pullback Up < ZD)
-                        if bi.type == "up" and bi.high < zs.zd:
+                        # Check 3rd Sell
+                        if check_3sell and bi.type == "up" and bi.high < zs.zd:
                              if not any(m.name == "3sell" and m.zs.index == zs.index for m in bi.mmds):
                                  bi.add_mmd("3sell", zs, zs_type)
                 
                 # 1st Buy/Sell (Trend Divergence)
-                # 1. Two centers (same level) trend divergence 1st buy/sell
-                # 2. After 3rd sell/buy, divergence 1st buy/sell
-                
-                # Check for 3rd Buy/Sell on previous stroke
                 has_prev_3sell = False
                 has_prev_3buy = False
                 if i >= 1:
@@ -943,8 +971,6 @@ class CL(ICL):
                     if bi.type == "up":
                         has_prev_3buy = any(m.name == "3buy" for m in prev_bi.get_mmds(zs_type))
 
-                # Strictly require QS (Trend Divergence) or PZ (Consolidation Divergence) for 1st Buy/Sell
-                # Must be a New Low (Buy) or New High (Sell) relative to previous same-direction stroke
                 is_new_extreme = True
                 if i >= 2:
                     prev_bi_2 = self.bis[i-2]
@@ -954,46 +980,39 @@ class CL(ICL):
                         is_new_extreme = False
 
                 if is_new_extreme:
-                    # Strict 1st Buy: Trend Divergence (QS)
-                    # Check if QS exists FOR THIS ZS
                     has_qs_zs = any(b.type == "qs" and b.zs.index == zs.index for b in bi.get_bcs(zs_type))
                     
                     if has_qs_zs: 
-                        if bi.type == "down" and bi.low < zs.zd:
+                        if check_1buy and bi.type == "down" and bi.low < zs.zd:
                             bi.add_mmd("1buy", zs, zs_type)
-                        if bi.type == "up" and bi.high > zs.zg:
+                        if check_1sell and bi.type == "up" and bi.high > zs.zg:
                             bi.add_mmd("1sell", zs, zs_type)
-                    # 1st Buy after 3rd Sell (with Divergence)
+                    
                     elif (has_prev_3sell or has_prev_3buy):
-                         # Check for any divergence (QS, PZ, BI) related to this ZS or generic
-                         # For QS/PZ, we check if they relate to this ZS
                          has_div_zs = any(b.type in ["qs", "pz"] and b.zs.index == zs.index for b in bi.get_bcs(zs_type))
-                         # For BI divergence, it's not tied to ZS, so we check general existence
                          has_div_bi = bi.bc_exists(["bi"], zs_type)
                          
                          if has_div_zs or has_div_bi:
-                             if bi.type == "down" and (bi.low < zs.zd or has_prev_3sell):
+                             if check_1buy and bi.type == "down" and (bi.low < zs.zd or has_prev_3sell):
                                 bi.add_mmd("1buy", zs, zs_type)
-                             if bi.type == "up" and (bi.high > zs.zg or has_prev_3buy):
+                             if check_1sell and bi.type == "up" and (bi.high > zs.zg or has_prev_3buy):
                                 bi.add_mmd("1sell", zs, zs_type)
 
                 # 2nd Buy/Sell
-                # Case 4: After 3S no 1B produced, subsequent no new low also appears 2B
-                # This depends on 'zs' loop variable (the pivot of the 3S)
                 if i >= 3:
                     prev_bi_2 = self.bis[i-2]
                     prev_bi_3 = self.bis[i-3]
                     
-                    # Check if prev_bi_2 was 1buy
                     is_1buy = any(m.name == "1buy" for m in prev_bi_2.get_mmds(zs_type))
+                    is_1sell = any(m.name == "1sell" for m in prev_bi_2.get_mmds(zs_type))
 
-                    if bi.type == "down":
+                    if check_2buy and bi.type == "down":
                         has_3sell_prev = any(m.name == "3sell" and m.zs.index == zs.index for m in prev_bi_3.get_mmds(zs_type))
                         if has_3sell_prev and not is_1buy and bi.low > prev_bi_2.low:
                             if not any(m.name == "2buy" and m.zs.index == zs.index for m in bi.get_mmds(zs_type)):
                                 bi.add_mmd("2buy", zs, zs_type)
 
-                    if bi.type == "up":
+                    if check_2sell and bi.type == "up":
                         has_3buy_prev = any(m.name == "3buy" and m.zs.index == zs.index for m in prev_bi_3.get_mmds(zs_type))
                         if has_3buy_prev and not is_1sell and bi.high < prev_bi_2.high:
                             if not any(m.name == "2sell" and m.zs.index == zs.index for m in bi.get_mmds(zs_type)):
@@ -1005,30 +1024,27 @@ class CL(ICL):
                 is_1buy = any(m.name == "1buy" for m in prev_bi_2.get_mmds(zs_type))
                 is_1sell = any(m.name == "1sell" for m in prev_bi_2.get_mmds(zs_type))
 
-                if bi.type == "down":
+                if check_2buy and bi.type == "down":
                     # Case 1 & 3: After 1buy
                     if is_1buy and bi.low > prev_bi_2.low:
-                         # Only add if not exists
                          target_zs = prev_bi_2.get_mmds(zs_type)[0].zs
                          if not any(m.name == "2buy" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
                              bi.add_mmd("2buy", target_zs, zs_type)
                     
-                    # Case 2: Trend + No New Low + Divergence (Runaway 2nd Buy)
-                    # Check if prev_bi_2 had QS or PZ relative to ANY ZS
-                    # We use the ZS from the divergence
+                    # Case 2: Trend + No New Low + Divergence
                     for b in prev_bi_2.get_bcs(zs_type):
                         if b.type in ["qs", "pz"] and b.zs is not None:
                              if bi.low > prev_bi_2.low and compare_ld_beichi(prev_bi_2.get_ld(self), bi.get_ld(self), "down"):
                                  if not any(m.name == "2buy" and m.zs.index == b.zs.index for m in bi.get_mmds(zs_type)):
                                      bi.add_mmd("2buy", b.zs, zs_type)
-                                     break # Only add once per stroke for Case 2? Or allow multiple ZS? Let's break to avoid duplicates if multiple divergences.
+                                     break
 
-                if bi.type == "up":
+                if check_2sell and bi.type == "up":
                     # Case 1 & 3
                     if is_1sell and bi.high < prev_bi_2.high:
-                        target_zs = prev_bi_2.get_mmds(zs_type)[0].zs
-                        if not any(m.name == "2sell" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
-                            bi.add_mmd("2sell", target_zs, zs_type)
+                         target_zs = prev_bi_2.get_mmds(zs_type)[0].zs
+                         if not any(m.name == "2sell" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
+                             bi.add_mmd("2sell", target_zs, zs_type)
                     
                     # Case 2
                     for b in prev_bi_2.get_bcs(zs_type):
@@ -1044,42 +1060,45 @@ class CL(ICL):
                 prev_bi = self.bis[i-1]
                 if bi.type == "down":
                     # Class 2 Buy
-                    has_2buy_mmds = [m for m in prev_bi_2.get_mmds(zs_type) if m.name == "2buy"]
-                    if has_2buy_mmds:
-                        zg = min(prev_bi_2.high, prev_bi.high, bi.high)
-                        if zg > bi.low and bi.low > prev_bi_2.low:
-                             # Use the ZS from the 2buy
-                             target_zs = has_2buy_mmds[0].zs
-                             if not any(m.name == "l2buy" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
-                                 bi.add_mmd("l2buy", target_zs, zs_type)
+                    if check_l2buy:
+                        has_2buy_mmds = [m for m in prev_bi_2.get_mmds(zs_type) if m.name == "2buy"]
+                        if has_2buy_mmds:
+                            zg = min(prev_bi_2.high, prev_bi.high, bi.high)
+                            if zg > bi.low and bi.low > prev_bi_2.low:
+                                 target_zs = has_2buy_mmds[0].zs
+                                 if not any(m.name == "l2buy" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
+                                     bi.add_mmd("l2buy", target_zs, zs_type)
                     
                     # Class 3 Buy
-                    has_3buy_mmds = [m for m in prev_bi_2.get_mmds(zs_type) if m.name == "3buy"]
-                    if has_3buy_mmds:
-                        zg = min(prev_bi_2.high, prev_bi.high, bi.high)
-                        if zg > bi.low and bi.low > prev_bi_2.low:
-                             target_zs = has_3buy_mmds[0].zs
-                             if not any(m.name == "l3buy" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
-                                 bi.add_mmd("l3buy", target_zs, zs_type)
+                    if check_l3buy:
+                        has_3buy_mmds = [m for m in prev_bi_2.get_mmds(zs_type) if m.name == "3buy"]
+                        if has_3buy_mmds:
+                            zg = min(prev_bi_2.high, prev_bi.high, bi.high)
+                            if zg > bi.low and bi.low > prev_bi_2.low:
+                                 target_zs = has_3buy_mmds[0].zs
+                                 if not any(m.name == "l3buy" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
+                                     bi.add_mmd("l3buy", target_zs, zs_type)
 
                 if bi.type == "up":
                     # Class 2 Sell
-                    has_2sell_mmds = [m for m in prev_bi_2.get_mmds(zs_type) if m.name == "2sell"]
-                    if has_2sell_mmds:
-                        zd = max(prev_bi_2.low, prev_bi.low, bi.low)
-                        if bi.high > zd and bi.high < prev_bi_2.high:
-                             target_zs = has_2sell_mmds[0].zs
-                             if not any(m.name == "l2sell" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
-                                 bi.add_mmd("l2sell", target_zs, zs_type)
+                    if check_l2sell:
+                        has_2sell_mmds = [m for m in prev_bi_2.get_mmds(zs_type) if m.name == "2sell"]
+                        if has_2sell_mmds:
+                            zd = max(prev_bi_2.low, prev_bi.low, bi.low)
+                            if bi.high > zd and bi.high < prev_bi_2.high:
+                                 target_zs = has_2sell_mmds[0].zs
+                                 if not any(m.name == "l2sell" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
+                                     bi.add_mmd("l2sell", target_zs, zs_type)
                     
                     # Class 3 Sell
-                    has_3sell_mmds = [m for m in prev_bi_2.get_mmds(zs_type) if m.name == "3sell"]
-                    if has_3sell_mmds:
-                        zd = max(prev_bi_2.low, prev_bi.low, bi.low)
-                        if bi.high > zd and bi.high < prev_bi_2.high:
-                             target_zs = has_3sell_mmds[0].zs
-                             if not any(m.name == "l3sell" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
-                                 bi.add_mmd("l3sell", target_zs, zs_type)
+                    if check_l3sell:
+                        has_3sell_mmds = [m for m in prev_bi_2.get_mmds(zs_type) if m.name == "3sell"]
+                        if has_3sell_mmds:
+                            zd = max(prev_bi_2.low, prev_bi.low, bi.low)
+                            if bi.high > zd and bi.high < prev_bi_2.high:
+                                 target_zs = has_3sell_mmds[0].zs
+                                 if not any(m.name == "l3sell" and m.zs.index == target_zs.index for m in bi.get_mmds(zs_type)):
+                                     bi.add_mmd("l3sell", target_zs, zs_type)
 
             for zs in zss:
                 # Only consider pivots that are "finished" or relevant
@@ -1098,6 +1117,14 @@ class CL(ICL):
                 is_pz, compare_line = self.beichi_pz(zs, bi)
                 if is_pz:
                      bi.add_bc("pz", zs, compare_line, [compare_line], True, zs_type)
+                else:
+                    # fallback: 离开段前一笔即中枢最后一线，比较进入段与当前段力度
+                    if i >= 1 and self.bis[i-1].index == zs.lines[-1].index:
+                        enter_idx = zs.lines[0].index - 1
+                        if enter_idx >= 0:
+                            entering_line = self.bis[enter_idx]
+                            if compare_ld_beichi(entering_line.get_ld(self), bi.get_ld(self), bi.type):
+                                bi.add_bc("pz", zs, entering_line, [entering_line], True, zs_type)
 
                 # Check QS (Trend Divergence)
                 # Needs at least 2 pivots.
@@ -1110,9 +1137,8 @@ class CL(ICL):
                 # Strict Check: The stroke BEFORE current bi must be the one that LEFT the pivot.
                 if i >= 1:
                     prev_bi = self.bis[i-1]
-                    # Check if prev_bi is the leaving stroke
-                    # The leaving stroke starts exactly at the pivot's end fractal.
-                    if prev_bi.start.index == zs.end.index:
+                    # 离开段等于中枢最后一线
+                    if prev_bi.index == zs.lines[-1].index:
                         # 3rd Buy
                         if bi.type == "down" and bi.low > zs.zg:
                              if not any(m.name == "3buy" and m.zs.index == zs.index for m in bi.mmds):
@@ -1148,26 +1174,39 @@ class CL(ICL):
 
                 if is_new_extreme:
                     # Strict 1st Buy: Trend Divergence (QS)
-                    # Check if QS exists FOR THIS ZS
-                    has_qs_zs = any(b.type == "qs" and b.zs.index == zs.index for b in bi.get_bcs(zs_type))
-                    
-                    if has_qs_zs: 
+                    # Check if QS exists FOR THIS ZS（当前或上一笔）
+                    has_qs_zs = any(
+                        b.type == "qs" and b.zs.index == zs.index for b in bi.get_bcs(zs_type)
+                    ) or (
+                        i >= 1
+                        and any(
+                            b.type == "qs" and b.zs.index == zs.index for b in self.bis[i - 1].get_bcs(zs_type)
+                        )
+                    )
+
+                    if has_qs_zs:
                         if bi.type == "down" and bi.low < zs.zd:
                             bi.add_mmd("1buy", zs, zs_type)
                         if bi.type == "up" and bi.high > zs.zg:
                             bi.add_mmd("1sell", zs, zs_type)
                     # 1st Buy after 3rd Sell (with Divergence)
-                    elif (has_prev_3sell or has_prev_3buy):
-                         # Check for any divergence (QS, PZ, BI) related to this ZS or generic
-                         # For QS/PZ, we check if they relate to this ZS
-                         has_div_zs = any(b.type in ["qs", "pz"] and b.zs.index == zs.index for b in bi.get_bcs(zs_type))
-                         # For BI divergence, it's not tied to ZS, so we check general existence
-                         has_div_bi = bi.bc_exists(["bi"], zs_type)
-                         
-                         if has_div_zs or has_div_bi:
-                             if bi.type == "down" and (bi.low < zs.zd or has_prev_3sell):
+                    elif has_prev_3sell or has_prev_3buy:
+                        # Check for any divergence (QS, PZ, BI) related to this ZS or generic（当前或上一笔）
+                        has_div_zs = any(
+                            b.type in ["qs", "pz"] and b.zs.index == zs.index for b in bi.get_bcs(zs_type)
+                        ) or (
+                            i >= 1
+                            and any(
+                                b.type in ["qs", "pz"] and b.zs.index == zs.index for b in self.bis[i - 1].get_bcs(zs_type)
+                            )
+                        )
+                        # For BI divergence, it's not tied to ZS, so we check general existence
+                        has_div_bi = bi.bc_exists(["bi"], zs_type)
+
+                        if has_div_zs or has_div_bi:
+                            if bi.type == "down" and (bi.low < zs.zd or has_prev_3sell):
                                 bi.add_mmd("1buy", zs, zs_type)
-                             if bi.type == "up" and (bi.high > zs.zg or has_prev_3buy):
+                            if bi.type == "up" and (bi.high > zs.zg or has_prev_3buy):
                                 bi.add_mmd("1sell", zs, zs_type)
 
                 # 2nd Buy/Sell
@@ -1373,7 +1412,7 @@ class CL(ICL):
                         j += 1
                     else:
                         break
-                i = j
+                i = j - 1
             else:
                 i += 1
         return zss
@@ -1382,82 +1421,65 @@ class CL(ICL):
         if len(zs.lines) < 1:
             return False, None
 
-        # Identify the list (BI or XD)
-        lines = None
-        if isinstance(now_line, BI):
-            lines = self.bis
-        elif isinstance(now_line, XD):
-            lines = self.xds
-        
+        lines = self.bis if isinstance(now_line, BI) else (self.xds if isinstance(now_line, XD) else None)
         if lines is None:
             return False, None
 
-        # Entering line is the one before the first line of ZS
-        first_zs_line = zs.lines[0]
-        entering_line_idx = first_zs_line.index - 1
-        
-        if entering_line_idx < 0:
+        first = zs.lines[0]
+        entering_idx = first.index - 1
+        if entering_idx < 0:
             return False, None
-            
-        entering_line = lines[entering_line_idx]
-        
-        # Check direction (Standard PZ: Entering and Leaving are same direction)
-        if entering_line.type != now_line.type:
+        entering = lines[entering_idx]
+
+        if now_line.start.index != zs.end.index:
             return False, None
-            
-        # Compare Force
-        ld1 = entering_line.get_ld(self)
+
+        group = [entering] + zs.lines + [now_line]
+        if now_line.type == "up":
+            enter_extreme = entering.high == max(l.high for l in group)
+            leave_extreme = now_line.high == max(l.high for l in group)
+        else:
+            enter_extreme = entering.low == min(l.low for l in group)
+            leave_extreme = now_line.low == min(l.low for l in group)
+
+        if not (enter_extreme and leave_extreme):
+            return False, None
+
+        ld1 = entering.get_ld(self)
         ld2 = now_line.get_ld(self)
-        
         if compare_ld_beichi(ld1, ld2, now_line.type):
-            # Also check if Leaving is Extreme (High/Low)
-            # Up Pivot: Leaving High > Entering High
-            # Down Pivot: Leaving Low < Entering Low
-            is_extreme = False
-            if now_line.type == "up" and now_line.high > entering_line.high:
-                is_extreme = True
-            elif now_line.type == "down" and now_line.low < entering_line.low:
-                is_extreme = True
-                
-            if is_extreme:
-                return True, entering_line
-                
+            return True, entering
         return False, None
 
     def beichi_qs(self, lines: List[LINE], zss: List[ZS], now_line: LINE) -> Tuple[bool, List[LINE]]:
         if len(zss) < 2:
             return False, []
-            
+
         zs1 = zss[-2]
         zs2 = zss[-1]
-        
         trend_type, _ = self.zss_is_qs(zs1, zs2)
         if not trend_type:
             return False, []
-            
+
         if trend_type == "up" and now_line.type != "up":
-             return False, []
-        if trend_type == "down" and now_line.type != "down":
-             return False, []
-             
-        # 寻找连接段 (Impulse 1)
-        # 连接段在 zs1.end 到 zs2.start 之间
-        # 简单处理：找到 lines 中位于 zs1 和 zs2 之间的最大力度的线
-        connect_lines = [l for l in lines if l.index > zs1.lines[-1].index and l.index < zs2.lines[0].index and l.type == now_line.type]
-        
-        if not connect_lines:
             return False, []
-            
-        # 取力度最大的连接段（通常连接段就是一笔，但如果有复杂结构可能多笔）
-        # 这里假设连接段就是 zs2 之前的同向段
-        c_line = connect_lines[-1]
-        
-        ld1 = c_line.get_ld(self)
+        if trend_type == "down" and now_line.type != "down":
+            return False, []
+
+        prev_same = [l for l in lines if l.index > zs1.lines[-1].index and l.index < now_line.index and l.type == now_line.type]
+        if not prev_same:
+            return False, []
+        ref = prev_same[-1]
+
+        if now_line.type == "up" and not (now_line.high > ref.high):
+            return False, []
+        if now_line.type == "down" and not (now_line.low < ref.low):
+            return False, []
+
+        ld1 = ref.get_ld(self)
         ld2 = now_line.get_ld(self)
-        
         if compare_ld_beichi(ld1, ld2, now_line.type):
-            return True, [c_line]
-            
+            return True, [ref]
         return False, []
 
     def zss_is_qs(self, one_zs: ZS, two_zs: ZS) -> Tuple[str, None]:
