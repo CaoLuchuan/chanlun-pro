@@ -378,10 +378,17 @@ class CL(ICL):
             return False
 
         # 方向必须满足：顶->低 新低；底->顶 新高
-        if start_fx.type == "ding" and end_fx.val >= start_fx.val:
-            return False
-        if start_fx.type == "di" and end_fx.val <= start_fx.val:
-            return False
+        # 严格检查：下笔的顶分型高点必须高于底分型高点（不仅仅是val，防止包含关系导致的误判）
+        # 严格检查：上笔的底分型低点必须低于顶分型低点
+        # 顶分型定义：中间K线高点最高。底分型定义：中间K线低点最低。
+        # 这里使用 fx.val (已经根据配置取了 High/Low)
+        if start_fx.type == "ding":
+            if end_fx.val >= start_fx.val: return False
+            if end_fx.high(Config.FX_QJ_CK.value, Config.FX_QY_THREE.value) >= start_fx.high(Config.FX_QJ_CK.value, Config.FX_QY_THREE.value): return False
+        
+        if start_fx.type == "di":
+            if end_fx.val <= start_fx.val: return False
+            if end_fx.low(Config.FX_QJ_CK.value, Config.FX_QY_THREE.value) <= start_fx.low(Config.FX_QJ_CK.value, Config.FX_QY_THREE.value): return False
 
         # 缠论K线中心索引差值（用于判断是否存在独立缠论K线）
         ck_diff = end_fx.k.index - start_fx.k.index
@@ -395,11 +402,19 @@ class CL(ICL):
             # 老笔：5根合并后的K线 (ck_diff >= 4 means 5 lines: 0, 1, 2, 3, 4)
             if ck_diff < 4:
                 return False
-            src_k_num = 0
-            for ck in self.cl_klines[start_fx.k.index : end_fx.k.index + 1]:
-                src_k_num += len(ck.klines)
-            if src_k_num < 3:
-                return False
+            # 确保中间有独立K线：顶底分型各3根，共用0根时至少5根，共用1根时5根...
+            # 标准老笔定义：顶分型+独立K线+底分型。
+            # 顶分型占3根，底分型占3根。如果完全不共用，需要3+N+3。
+            # 但缠论允许共用，只要顶底不重叠。
+            # 最严格定义：顶分型区间与底分型区间不重叠。
+            # ck_diff >= 4 意味着：Index 0 (Start), 1, 2, 3, 4 (End)。
+            # 中间有 1, 2, 3 三根。
+            # 顶分型用到 0, 1 (如果用FX_QY_MIDDLE则只看0)。
+            # 通常老笔要求：顶底分型之间至少有一根不属于顶也不属于底的K线？
+            # 不，老笔定义是：顶分型和底分型之间至少有一根独立的K线，或者顶分型底分型完全不共用K线。
+            # ck_diff = 4: Start(0), 1, 2, 3, End(4).
+            # Ding(0): [ -1, 0, 1] (假设) -> End(4): [3, 4, 5].
+            # 此时 2 是独立的。所以 ck_diff >= 4 是满足“中间有独立K线”的最小条件。
             return True
         elif bi_type == Config.BI_TYPE_NEW.value:
             # 新笔：4根合并后的K线 (ck_diff >= 3 means 4 lines) 且 5根原始K线
