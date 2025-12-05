@@ -168,21 +168,6 @@ class ChartManager {
   // 初始化图表
   init() {
     this.udf_datafeed = new Datafeeds.UDFCompatibleDatafeed("/tv", 30000);
-    let theme = Utils.get_local_data("theme");
-    if (theme === "dark") {
-      theme = "Dark";
-    }
-    const marketTzMaps = {
-      a: "Asia/Shanghai",
-      hk: "Asia/Shanghai",
-      fx: "Asia/Shanghai",
-      us: "America/New_York",
-      futures: "Asia/Shanghai",
-      ny_futures: "Asia/Shanghai",
-      currency: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      currency_spot: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    };
-    const tz = marketTzMaps[Utils.get_market()] || Intl.DateTimeFormat().resolvedOptions().timeZone;
     this.widget = window.tvWidget = new TradingView.widget({
       debug: false,
       autosize: true,
@@ -194,17 +179,10 @@ class ChartManager {
       ),
       datafeed: this.udf_datafeed,
       library_path: "static/charting_library/",
-      theme: theme,
-      overrides: {
-        "paneProperties.background": theme === "Dark" ? "#131722" : "#ffffff",
-        "paneProperties.backgroundType": "solid",
-      },
-      loading_screen: {
-        backgroundColor: theme === "Dark" ? "#131722" : "#ffffff",
-      },
+      theme: Utils.get_local_data("theme"),
       numeric_formatting: { decimal_sign: "." },
       time_frames: [],
-      timezone: tz,
+      timezone: "Asia/Shanghai",
       locale: "zh",
       symbol_search_request_delay: 100,
       auto_save_delay: 5,
@@ -298,17 +276,6 @@ class ChartManager {
         console.error("Failed to get active chart");
         return;
       }
-
-      // 强制应用主题背景色
-      let theme = Utils.get_local_data("theme");
-      if (theme === "dark") {
-        theme = "Dark";
-      }
-      const bgColor = theme === "Dark" ? "#131722" : "#ffffff";
-      this.widget.applyOverrides({
-        "paneProperties.background": bgColor,
-        "paneProperties.backgroundType": "solid",
-      });
 
       // 订阅事件
       this.chart
