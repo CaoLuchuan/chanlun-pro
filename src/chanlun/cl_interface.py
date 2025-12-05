@@ -499,6 +499,10 @@ class BI(LINE):
 
         # 记录是否是拆分笔
         self.is_split = ""
+        
+        # 笔确认机制相关属性
+        self.confirmed = False  # 笔是否被反向下一笔确认
+        self.feature_sequence_verified = False  # 特征序列分型是否验证通过
 
     @property
     def td(self):
@@ -516,6 +520,12 @@ class BI(LINE):
         返回笔是否完成
         """
         return self.end.done
+    
+    def is_confirmed(self) -> bool:
+        """
+        返回笔是否被确认（特征序列验证通过且被反向下一笔确认）
+        """
+        return self.confirmed and self.feature_sequence_verified
 
     def fx_num(self) -> int:
         """

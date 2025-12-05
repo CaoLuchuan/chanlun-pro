@@ -1608,16 +1608,16 @@ def lines_to_charts(lines: List[LINE]):
     # print(f'No dones : {no_dones}')
     if len(dones) > 0:
         line_dones["index"].append(dones[0].start.k.date)
-        line_dones["val"].append(dones[0].start.val)
+        line_dones["val"].append(dones[0].low if dones[0].type == "up" else dones[0].high)
     for _l in dones:
         line_dones["index"].append(_l.end.k.date)
-        line_dones["val"].append(_l.end.val)
+        line_dones["val"].append(_l.high if _l.type == "up" else _l.low)
     if len(no_dones) > 0:
         line_no_dones["index"].append(no_dones[0].start.k.date)
-        line_no_dones["val"].append(no_dones[0].start.val)
+        line_no_dones["val"].append(no_dones[0].low if no_dones[0].type == "up" else no_dones[0].high)
     for _l in no_dones:
         line_no_dones["index"].append(_l.end.k.date)
-        line_no_dones["val"].append(_l.end.val)
+        line_no_dones["val"].append(_l.high if _l.type == "up" else _l.low)
     return line_dones, line_no_dones
 
 

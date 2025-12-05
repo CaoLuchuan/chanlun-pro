@@ -48,6 +48,9 @@ class CL(ICL):
 
         self.last_bi_zs: Union[ZS, None] = None
         self.last_xd_zs: Union[ZS, None] = None
+        
+        # 笔确认机制相关状态
+        self.pending_bis: List[BI] = []  # 待确认的笔列表
 
     def get_code(self) -> str:
         return self.code
@@ -255,7 +258,7 @@ class CL(ICL):
             last_ck = self.cl_klines[-1]
 
             is_included = False
-            if (k.h >= last_ck.h and k.l <= last_ck.l) or (last_ck.h >= k.h and last_ck.l <= k.l):
+            if (k.h >= last_ck.h - 1e-7 and k.l <= last_ck.l + 1e-7) or (last_ck.h >= k.h - 1e-7 and last_ck.l <= k.l + 1e-7):
                 is_included = True
             
             if is_included:
@@ -389,19 +392,29 @@ class CL(ICL):
             src_k_num += len(ck.klines)
 
         if bi_type == Config.BI_TYPE_OLD.value:
-            # 老笔：分型不共用缠论K线，分型之间至少有一根独立缠论K线
-            return ck_diff >= 2
+            # 老笔：5根合并后的K线 (ck_diff >= 4 means 5 lines: 0, 1, 2, 3, 4)
+            if ck_diff < 4:
+                return False
+            src_k_num = 0
+            for ck in self.cl_klines[start_fx.k.index : end_fx.k.index + 1]:
+                src_k_num += len(ck.klines)
+            if src_k_num < 3:
+                return False
+            return True
         elif bi_type == Config.BI_TYPE_NEW.value:
-            # 新笔：分型之间至少5根原始K线，且不共用缠论K线（至少一根独立缠论K线）
-            return src_k_num >= 5 and ck_diff >= 2
+            # 新笔：4根合并后的K线 (ck_diff >= 3 means 4 lines) 且 5根原始K线
+            # 用户需求：新笔4根合并K线，5根原始K线
+            if src_k_num < 5:
+                return False
+            return ck_diff >= 3
         elif bi_type == Config.BI_TYPE_JDB.value:
             # 简单笔：至少5根原始K线即可
             return src_k_num >= 5
         elif bi_type == Config.BI_TYPE_DD.value:
-            # 顶底成笔：出现相邻顶底即可
-            return True
+            # 顶底成笔：需满足有一根独立K线
+            return ck_diff >= 4
         else:
-            return ck_diff >= 2
+            return ck_diff >= 4
 
     def _bi_high_low(self, start_fx: FX, end_fx: FX) -> Tuple[float, float]:
         qy = self.config.get("fx_qy", Config.FX_QY_THREE.value)
@@ -435,7 +448,7 @@ class CL(ICL):
                 
             last = processed[-1]
             # 包含关系判断
-            is_included = (k.h >= last.h and k.l <= last.l) or (last.h >= k.h and last.l <= k.l)
+            is_included = (k.h >= last.h - 1e-7 and k.l <= last.l + 1e-7) or (last.h >= k.h - 1e-7 and last.l <= k.l + 1e-7)
             
             if is_included:
                 # 标记被包含的K线
@@ -462,9 +475,96 @@ class CL(ICL):
                 processed.append(k)
         
         return processed
+    
+    def _verify_feature_sequence(self, bi: BI) -> bool:
+        """
+        验证笔的特征序列分型
+        根据缠论原著，笔的结束需要通过特征序列的分型来确认
+        """
+        if bi.type == "up":
+            # 向上笔的特征序列是向下笔
+            return self._check_up_bi_feature_sequence(bi)
+        else:
+            # 向下笔的特征序列是向上笔  
+            return self._check_down_bi_feature_sequence(bi)
+    
+    def _check_up_bi_feature_sequence(self, bi: BI) -> bool:
+        """
+        检查向上笔的特征序列分型
+        向上笔的特征序列是向下笔，需要找到有效的底分型来确认笔结束
+        """
+        end_index = bi.end.k.index
+        
+        # 特征序列分型应该在笔结束后形成
+        if end_index + 3 >= len(self.cl_klines):
+            return False
+            
+        # 从笔结束位置开始向后查找特征序列的底分型
+        # 特征序列是笔结束后的反向笔序列（向下笔）
+        for i in range(end_index + 1, len(self.cl_klines) - 2):
+            k1 = self.cl_klines[i]
+            k2 = self.cl_klines[i+1]
+            k3 = self.cl_klines[i+2]
+            
+            # 检查是否为有效的底分型（中间K线低点最低）
+            if k2.l < k1.l and k2.l < k3.l:
+                # 底分型应该确认笔的结束，所以其低点不能创新低（高于笔的起点）
+                if k2.l > bi.start.val:
+                    # 检查分型有效性：不能有包含关系
+                    if not hasattr(k2, '_is_included') or not k2._is_included:
+                        return True
+                        
+        return False
+    
+    def _check_down_bi_feature_sequence(self, bi: BI) -> bool:
+        """
+        检查向下笔的特征序列分型
+        向下笔的特征序列是向上笔，需要找到有效的顶分型来确认笔结束
+        """
+        end_index = bi.end.k.index
+        
+        # 特征序列分型应该在笔结束后形成
+        if end_index + 3 >= len(self.cl_klines):
+            return False
+            
+        # 从笔结束位置开始向后查找特征序列的顶分型
+        # 特征序列是笔结束后的反向笔序列（向上笔）
+        for i in range(end_index + 1, len(self.cl_klines) - 2):
+            k1 = self.cl_klines[i]
+            k2 = self.cl_klines[i+1]
+            k3 = self.cl_klines[i+2]
+            
+            # 检查是否为有效的顶分型（中间K线高点最高）
+            if k2.h > k1.h and k2.h > k3.h:
+                # 顶分型应该确认笔的结束，所以其高点不能创新高（低于笔的起点）
+                if k2.h < bi.start.val:
+                    # 检查分型有效性：不能有包含关系
+                    if not hasattr(k2, '_is_included') or not k2._is_included:
+                        return True
+                        
+        return False
+    
+    def _confirm_bi_with_next_bi(self, bi: BI, next_bi: BI) -> bool:
+        """
+        通过反向下一笔来确认前一笔的结束
+        """
+        # 检查笔的方向是否相反
+        if bi.type == next_bi.type:
+            return False
+            
+        # 检查下一笔是否有效确认前一笔
+        if bi.type == "up":
+            # 向上笔需要被向下笔确认
+            # 向下笔的起点（顶分型）应该低于或等于向上笔的终点（顶分型）
+            return next_bi.start.val <= bi.end.val
+        else:
+            # 向下笔需要被向上笔确认  
+            # 向上笔的起点（底分型）应该高于或等于向下笔的终点（底分型）
+            return next_bi.start.val >= bi.end.val
 
     def _cal_bi(self):
         self.bis = []
+        self.pending_bis = []  # 清空待确认笔列表
         if len(self.fxs) < 2:
             return
 
@@ -485,6 +585,10 @@ class CL(ICL):
                     index=len(self.bis)
                 )
                 bi.high, bi.low = self._bi_high_low(start_fx, end_fx)
+                
+                # 初始笔不进行确认，直接加入待确认列表
+                bi.feature_sequence_verified = self._verify_feature_sequence(bi)
+                self.pending_bis.append(bi)
                 self.bis.append(bi)
                 break
             
@@ -525,6 +629,8 @@ class CL(ICL):
                     # Extend the last pen
                     last_bi.end = next_fx
                     last_bi.high, last_bi.low = self._bi_high_low(last_bi.start, next_fx)
+                    # 笔被延伸，需要重新验证特征序列
+                    last_bi.feature_sequence_verified = self._verify_feature_sequence(last_bi)
                     # Note: We do not add a new pen. We modified the existing one.
                 
                 curr_fx_idx += 1
@@ -532,14 +638,71 @@ class CL(ICL):
 
             # Check 2: Different Type (Potential New Pen)
             if self.check_bi_valid(start_fx, next_fx, bi_type):
-                bi = BI(
-                    start=start_fx,
-                    end=next_fx,
-                    _type="down" if start_fx.type == "ding" else "up",
-                    index=len(self.bis)
-                )
-                bi.high, bi.low = self._bi_high_low(start_fx, next_fx)
-                self.bis.append(bi)
+                # 增加下一笔确认逻辑
+                # 笔必须要等下一个反向笔确认，如果相反分型K线个数不满足，笔会延伸
+                is_confirm = False
+                # 如果是最后一个分型，直接确认（或者是未完成的笔）
+                if curr_fx_idx == len(self.fxs) - 1:
+                    is_confirm = True
+                else:
+                    # 向后查找，看能否形成下一笔
+                    check_idx = curr_fx_idx + 1
+                    while check_idx < len(self.fxs):
+                        check_fx = self.fxs[check_idx]
+                        # 1. 如果遇到同向分型（与 next_fx 同向），且更极端，说明 next_fx 会延伸，当前 next_fx 无效
+                        if check_fx.type == next_fx.type:
+                            if next_fx.type == "ding" and check_fx.val >= next_fx.val:
+                                break # next_fx 被延伸，当前不成笔
+                            if next_fx.type == "di" and check_fx.val <= next_fx.val:
+                                break # next_fx 被延伸，当前不成笔
+                        
+                        # 2. 如果遇到反向分型（与 next_fx 反向，即与 start_fx 同向），且更极端，说明 start_fx 会延伸，当前笔无效
+                        # 这种情况在 _cal_bi 主循环的 "Check 1" 中处理，但在 Lookahead 中也需要判断
+                        if check_fx.type == start_fx.type:
+                             if start_fx.type == "ding" and check_fx.val >= start_fx.val:
+                                 break # start_fx 被延伸
+                             if start_fx.type == "di" and check_fx.val <= start_fx.val:
+                                 break # start_fx 被延伸
+
+                        # 3. 检查能否成笔
+                        if self.check_bi_valid(next_fx, check_fx, bi_type):
+                            is_confirm = True
+                            break
+                        
+                        check_idx += 1
+                    
+                    # 如果遍历完都没找到确认笔，且没有被延伸，说明后续震荡收敛或数据结束
+                    # 如果是因为数据结束（循环正常结束），可以算作确认（未完成）
+                    if not is_confirm and check_idx >= len(self.fxs):
+                        is_confirm = True
+
+                if is_confirm:
+                    new_bi = BI(
+                        start=start_fx,
+                        end=next_fx,
+                        _type="down" if start_fx.type == "ding" else "up",
+                        index=len(self.bis)
+                    )
+                    new_bi.high, new_bi.low = self._bi_high_low(start_fx, next_fx)
+                    
+                    # 验证特征序列分型
+                    new_bi.feature_sequence_verified = self._verify_feature_sequence(new_bi)
+                    
+                    # 检查是否可以确认之前的笔
+                    if len(self.pending_bis) > 0:
+                        last_pending_bi = self.pending_bis[-1]
+                        # 通过反向下一笔来确认前一笔
+                        if self._confirm_bi_with_next_bi(last_pending_bi, new_bi):
+                            last_pending_bi.confirmed = True
+                            # 从待确认列表中移除已确认的笔
+                            self.pending_bis.pop()
+                    
+                    # 将新笔加入待确认列表
+                    self.pending_bis.append(new_bi)
+                    self.bis.append(new_bi)
+                else:
+                    # Not confirmed, ignore next_fx (treat as glitch)
+                    pass
             else:
                 # Invalid New Pen.
                 # Just ignore next_fx.

@@ -474,12 +474,20 @@ class ChartManager {
           const key = JSON.stringify(bi);
           const existed = chartContainer.bis.find((item) => item.key === key);
           if (existed) return;
+          
+          // 根据确认状态设置不同的颜色和线宽
+          const isConfirmed = bi.confirmed !== false; // 默认为已确认
+          const lineColor = isConfirmed ? CHART_CONFIG.COLORS.BI : "#4e4c4cff"; // 未确认笔使用灰色
+          const lineWidth = isConfirmed ? 1 : 2; // 未确认笔使用更粗的线
+          const lineStyle = isConfirmed ? CHART_CONFIG.LINE_STYLES.SOLID : CHART_CONFIG.LINE_STYLES.DASHED; // 未确认笔使用虚线
+          
           chartContainer.bis.push({
             time: bi.points[0].time,
             key,
             id: ChartUtils.createLineShape(this.chart, bi, {
-              color: CHART_CONFIG.COLORS.BI,
-              linewidth: 1,
+              color: lineColor,
+              linewidth: lineWidth,
+              linestyle: lineStyle,
             }),
           });
         }

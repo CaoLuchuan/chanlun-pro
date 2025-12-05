@@ -708,6 +708,7 @@ def cl_data_to_tv_chart(
                         },
                     ],
                     "linestyle": "0" if bi.is_done() else "1",
+                    "confirmed": getattr(bi, 'confirmed', True),
                 }
             )
 
