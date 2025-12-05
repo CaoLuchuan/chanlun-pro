@@ -556,223 +556,448 @@ class CL(ICL):
         allow_bi_pohuai = self.config.get("xd_allow_bi_pohuai", "yes")
 
         start_idx = 0
+
+        # 0. 初始线段方向智能识别
+        # 如果起始阶段处于明显的趋势中，但第一笔的方向与趋势相反，会导致第一段线段无法结束（找不到特征序列的分型），从而产生超长线段
+        # 因此，这里预读前几笔，判断局部趋势，强制第一笔顺应趋势
+        if len(self.bis) > 4:
+            up_score = 0
+            down_score = 0
+            # 检查前10笔的趋势特征
+            check_len = min(12, len(self.bis))
+            for i in range(2, check_len):
+                # 仅比较同向笔
+                if self.bis[i].type == self.bis[i-2].type:
+                    if self.bis[i].high > self.bis[i-2].high:
+                        up_score += 1
+                    if self.bis[i].low > self.bis[i-2].low:
+                        up_score += 1
+                    if self.bis[i].high < self.bis[i-2].high:
+                        down_score += 1
+                    if self.bis[i].low < self.bis[i-2].low:
+                        down_score += 1
+            
+            # 如果趋势明显，调整起始位置
+            # 阈值设为 check_len // 3，确保有一定的趋势性
+            threshold = check_len // 3
+            if up_score > down_score + threshold: # 显著上涨
+                if self.bis[start_idx].type == "down":
+                    start_idx += 1
+            elif down_score > up_score + threshold: # 显著下跌
+                if self.bis[start_idx].type == "up":
+                    start_idx += 1
+
         while start_idx <= len(self.bis) - 3:
-            # 1. 检查起始三笔是否有重叠 (线段定义的必要条件)
-            bi1, bi2, bi3 = self.bis[start_idx], self.bis[start_idx+1], self.bis[start_idx+2]
-            if not (max(bi1.low, bi2.low, bi3.low) < min(bi1.high, bi2.high, bi3.high)):
+            start_bi = self.bis[start_idx]
+            
+            # 1. 确定目标线段方向
+            xd_dir = start_bi.type
+            if len(self.xds) > 0:
+                last_xd = self.xds[-1]
+                # 必须与上一线段反向
+                required_dir = "down" if last_xd.type == "up" else "up"
+                
+                if start_bi.type != required_dir:
+                    # 方向相同，检查是否延伸上一线段
+                    is_extension = False
+                    if last_xd.type == "up":
+                        if start_bi.high > last_xd.high:
+                            is_extension = True
+                            last_xd.high = start_bi.high
+                            last_xd.end = start_bi.end
+                            last_xd.end_line = start_bi
+                    else:
+                        if start_bi.low < last_xd.low:
+                            is_extension = True
+                            last_xd.low = start_bi.low
+                            last_xd.end = start_bi.end
+                            last_xd.end_line = start_bi
+                    
+                    if is_extension:
+                        # 延伸了，上一线段结束点变更为当前笔，继续往后找
+                        start_idx = start_bi.index + 1
+                        continue
+                    else:
+                        # 同向但未延伸（包含在内部），跳过该笔，寻找下一个反向笔
+                        start_idx += 1
+                        continue
+                
+                xd_dir = required_dir
+
+            # 第一段线段的特殊检查
+            # if len(self.xds) == 0:
+            #      bi1, bi2, bi3 = self.bis[start_idx], self.bis[start_idx+1], self.bis[start_idx+2]
+            #      # 简单的重叠检查，确保不是单边上涨/下跌中途开始
+            #      if not (max(bi1.low, bi2.low, bi3.low) < min(bi1.high, bi2.high, bi3.high)):
+            #          start_idx += 1
+            #          continue
+
+            # 2. 特征序列分析与线段构建
+            feature_dir = "down" if xd_dir == "up" else "up"
+            
+            # 严格检查：如果当前笔方向与目标线段方向不一致（同向），说明逻辑有误，跳过
+            if start_bi.type != xd_dir:
                 start_idx += 1
                 continue
 
-            start_bi = self.bis[start_idx]
-            xd_dir = start_bi.type
-            feature_dir = "down" if xd_dir == "up" else "up"
             tzxls: List[TZXL] = []
             made = False
-            last_same = start_bi
-
-            # 笔破坏检查
-            bi_pohuai_done = False
-
-            for i in range(start_idx + 1, len(self.bis)):
-                bi = self.bis[i]
+            
+            # 笔破坏检查标记
+            # 如果刚开始就遇到反向笔破坏（V反），直接生成线段
+            
+            current_search_idx = start_idx + 1
+            while current_search_idx < len(self.bis):
+                bi = self.bis[current_search_idx]
                 
-                # 笔破坏判断 (标准线段被第一笔反向笔直接破坏)
-                if allow_bi_pohuai == "yes" and not bi_pohuai_done:
-                    # 必须是特征序列方向的笔 (反向笔)
-                    if bi.type == feature_dir:
-                        pohuai = False
-                        if xd_dir == "up" and bi.low < start_bi.low:
+                # 笔破坏判断 (仅在特征序列为空时检查，即线段刚开始的第一笔反向)
+                # 修正：为了避免震荡中频繁出现微小线段破坏导致线段切碎，这里增加限制
+                # 只有当反向笔力度极大（例如有缺口，或者跌幅巨大）时才允许笔破坏
+                # 暂时策略：仅当配置明确允许且满足缺口条件时触发？或者直接从严，取消普通笔破坏。
+                # 根据用户反馈，历史数据容易乱，建议从严。
+                # 这里改为：必须有缺口才能触发笔破坏（即 V反+跳空）
+                
+                if allow_bi_pohuai == "yes" and len(tzxls) == 0 and bi.type == feature_dir:
+                    pohuai = False
+                    has_gap = False
+                    
+                    if xd_dir == "up":
+                        if bi.low < start_bi.low:
                             pohuai = True
-                        elif xd_dir == "down" and bi.high > start_bi.high:
+                            # 检查是否有缺口 (反向笔的高点 低于 前一笔的低点？不对，是反向笔的最高点 < start_bi 的最低点)
+                            # start_bi 是 Up 笔。 bi 是 Down 笔。
+                            # 缺口：Down笔最高点 < Up笔最低点 (直接跳空低开低走)
+                            if bi.high < start_bi.low: has_gap = True
+                    elif xd_dir == "down":
+                        if bi.high > start_bi.high:
                             pohuai = True
-                        
-                        if pohuai:
-                            # 发生笔破坏，线段直接结束
-                            xd = XD(start_bi.start, bi.end, start_bi, bi, xd_dir, None, None, len(self.xds))
-                            if xd_dir == "up":
-                                xd.high = start_bi.high # 笔破坏通常只有第一笔
-                                xd.low = bi.low
-                            else:
-                                xd.high = bi.high
-                                xd.low = start_bi.low
-                            xd.done = True
-                            # 标记为笔破坏
-                            xd.is_split = "bi_pohuai"
-                            self.xds.append(xd)
-                            
-                            made = True
-                            start_idx = i 
-                            bi_pohuai_done = True # 标记已处理
-                            break
-
-                if bi.type == xd_dir:
-                    last_same = bi
-                if bi.type != feature_dir:
-                    continue
-
-                # 特征序列元素
-                tz = TZXL(feature_dir, bi, None, False, True)
-                tz.max = bi.high
-                tz.min = bi.low
-                tz.lines = [bi]
-
-                # 特征序列包含处理
-                if tzxls:
-                    last = tzxls[-1]
-                    # 包含关系判断：tz 在 last 中，或者 last 在 tz 中
-                    inc = (tz.max <= last.max and tz.min >= last.min) or (last.max <= tz.max and last.min >= tz.min)
-                    if inc:
-                        # 包含处理方向：取决于线段方向
-                        # 向上线段 (xd_dir='up')，特征序列是向下的笔，但包含处理方向与线段方向相同（向上处理，取高高）
+                            # 缺口：Up笔最低点 > Down笔最高点
+                            if bi.low > start_bi.high: has_gap = True
+                    
+                    # 只有在有缺口 或 破坏幅度极大（怎么定义极大？暂时只用缺口）的情况下才触发
+                    # 或者，为了解决用户的“断掉”问题，我们暂时屏蔽掉无缺口的笔破坏
+                    if pohuai and has_gap:
+                        # 发生笔破坏，线段直接结束
+                        xd = XD(start_bi.start, bi.end, start_bi, bi, xd_dir, None, None, len(self.xds))
                         if xd_dir == "up":
-                            last.max = max(last.max, tz.max)
-                            last.min = max(last.min, tz.min)
+                            xd.high = start_bi.high
+                            xd.low = bi.low
                         else:
-                            # 向下线段：特征序列向上笔，但包含处理方向与线段方向相同（向下处理，取低低）
-                            last.max = min(last.max, tz.max)
-                            last.min = min(last.min, tz.min)
-                        last.lines.append(bi)
+                            xd.high = bi.high
+                            xd.low = start_bi.low
+                        xd.done = True
+                        xd.is_split = "bi_pohuai"
+                        self.xds.append(xd)
+                        
+                        # 新线段从破坏笔开始（V反）
+                        start_idx = bi.index
+                        made = True
+                        break
+
+                # 收集特征序列
+                if bi.type == feature_dir:
+                    # 检查是否触发上一线段的延伸
+                    # 如果当前特征序列笔（与线段方向相反的笔，即反向线段的内部同向笔）突破了上一线段的极值
+                    # 说明上一线段并未结束，而是发生了延伸
+                    is_ext = False
+                    if len(self.xds) > 0:
+                        last_xd = self.xds[-1]
+                        if last_xd.type == "up" and feature_dir == "up":
+                            if bi.high > last_xd.high:
+                                last_xd.high = bi.high
+                                last_xd.end = bi.end
+                                last_xd.end_line = bi
+                                is_ext = True
+                        elif last_xd.type == "down" and feature_dir == "down":
+                            if bi.low < last_xd.low:
+                                last_xd.low = bi.low
+                                last_xd.end = bi.end
+                                last_xd.end_line = bi
+                                is_ext = True
+                    
+                    if is_ext:
+                        start_idx = bi.index + 1
+                        made = True
+                        break
+
+                    tz = TZXL(feature_dir, bi, None, False, True)
+                    tz.max = bi.high
+                    tz.min = bi.low
+                    tz.lines = [bi]
+
+                    # 包含处理
+                    if tzxls:
+                        last = tzxls[-1]
+                        inc = (tz.max <= last.max and tz.min >= last.min) or (last.max <= tz.max and last.min >= tz.min)
+                        if inc:
+                            # 包含处理方向取决于线段方向
+                            if xd_dir == "up": # 向上线段，特征序列向上处理（高高）
+                                last.max = max(last.max, tz.max)
+                                last.min = max(last.min, tz.min)
+                            else: # 向下线段，特征序列向下处理（低低）
+                                last.max = min(last.max, tz.max)
+                                last.min = min(last.min, tz.min)
+                            last.lines.append(bi)
+                        else:
+                            tzxls.append(tz)
                     else:
                         tzxls.append(tz)
-                else:
-                    tzxls.append(tz)
 
-                # 检查特征序列分型
-                if len(tzxls) >= 3:
-                    t1, t2, t3 = tzxls[-3], tzxls[-2], tzxls[-1]
-                    
                     # 分型判断
-                    is_fx = False
-                    if xd_dir == "up":
-                        # 向上线段，找特征序列的顶分型 (因为特征序列是向下笔，趋势是上升的? 不，特征序列是向下笔，如果趋势向上，它们应该是一底比一底高。如果出现顶分型，说明底不再抬高，反而降低)
-                        # 修正：向上线段，特征序列为向下笔。正常延伸时，向下笔的低点应该不断抬高？不对。
-                        # 向上线段：笔是 上、下、上、下...
-                        # 特征序列（下笔）：下1、下2、下3...
-                        # 如果线段延伸，下2应该比下1高（即下2的底 > 下1的底？或者下2的顶 > 下1的顶？）
-                        # 标准定义：向上线段，特征序列（下笔）的区间应该是“向上”的。即 T2 > T1.
-                        # 如果出现顶分型 (T2 > T1 且 T2 > T3)，说明“向上”趋势终结。
-                        # 所以找顶分型是对的。
-                        if t2.max >= t1.max and t2.max >= t3.max:
-                            is_fx = True
-                    else:
-                        # 向下线段，找特征序列的底分型
-                        if t2.min <= t1.min and t2.min <= t3.min:
-                            is_fx = True
-                    
-                    if is_fx:
-                        # 缺口判断 (第一元素与第二元素)
-                        has_gap = False
+                    if len(tzxls) >= 3:
+                        t1, t2, t3 = tzxls[-3], tzxls[-2], tzxls[-1]
+                        is_fx = False
+                        
                         if xd_dir == "up":
-                            # 向上线段，特征序列顶分型
-                            # 缺口：T2 与 T1 之间没有重叠。因为是向上趋势，T2 应该在 T1 之上。
-                            # 如果 T2.min > T1.max，则为缺口
-                            if t2.min > t1.max: has_gap = True
+                            # 向上线段，特征序列(下笔)找顶分型
+                            if t2.max >= t1.max and t2.max >= t3.max:
+                                is_fx = True
                         else:
-                            # 向下线段，特征序列底分型
-                            # 缺口：T2 在 T1 之下。
-                            # 如果 T2.max < T1.min，则为缺口
-                            if t2.max < t1.min: has_gap = True
-
-                        # 线段结束确认 (参照开发指南.md)
-                        is_valid = False
+                            # 向下线段，特征序列(上笔)找底分型
+                            if t2.min <= t1.min and t2.min <= t3.min:
+                                is_fx = True
                         
-                        # 1. 基础分型有效
-                        
-                        # 2. 破坏确认 (t3 必须突破 t1 的极值)
-                        # 向上线段(找顶分型): T3 必须跌破 T1 的底 (T3.low < T1.low) ?
-                        # 开发指南: "return third['low'] < first['low']" (for Up Segment)
-                        # 向下线段(找底分型): T3 必须升破 T1 的顶 (T3.high > T1.high)
-                        
-                        break_condition = False
-                        if xd_dir == "up":
-                             if t3.min < t1.min: break_condition = True
-                        else:
-                             if t3.max > t1.max: break_condition = True
-                             
-                        # 3. 缺口特殊处理
-                        # 如果有缺口，必须满足 break_condition (其实标准缠论中，有缺口即为“第二种破坏”，通常需要确认)
-                        # 如果无缺口，也建议满足 break_condition 以过滤假突破
-                        
-                        if has_gap:
-                            # 有缺口，必须强力确认 (即 T3 至少要回补缺口，甚至突破 T1)
-                            # 原代码逻辑：T3 回补缺口即可 (T3.min <= T1.max for UP)
-                            # 开发指南逻辑：似乎更严格
-                            # 采用折中方案：必须满足 break_condition
-                            if break_condition: is_valid = True
-                        else:
-                            # 无缺口，标准分型
-                            # 是否强制要求 break_condition? 
-                            # 严格缠论中，无缺口的分型直接成立。但为了过滤震荡，加上 break_condition 会更稳健。
-                            # 原代码没有 break_condition。
-                            # 依据开发指南，加上。
-                            if break_condition: is_valid = True
-                            # 如果不加 break_condition，可能会在震荡中频繁切断。
-                            # 但如果严格按照缠论，“顶分型无缺口”即成立。
-                            # 考虑到“开发指南”特别提到了 verify_fractals 和 check_break_condition，我们加上它。
-                            # 如果不想太严格，可以保留原代码的“无缺口即成立”。
-                            # 这里遵循“修正”指令，倾向于更准确/严格的实现。
-                            pass
-
-                        if is_valid:
-                            # 找到分型顶点对应的笔
-                            # t2 包含的笔中，极值笔
+                        if is_fx:
+                            # 缺口判断 (Check Gap between 1st and 3rd element)
+                            # 特征序列缺口定义：分型的第一元素和第三元素之间没有重叠区间
+                            has_gap = False
                             if xd_dir == "up":
-                                peak = max(t2.lines, key=lambda b: b.high)
-                                fx_obj = XLFX("ding", t2, [t1, t2, t3], True)
+                                # 向上线段，特征序列(下笔)找顶分型
+                                # 第一元素(t1)与第三元素(t3)无重叠
+                                # 既然是顶分型，t2高点最高。如果t3的最高点 < t1的最低点，则肯定无重叠（巨大跳空）
+                                # 或者 t3的最低点 > t1的最高点？(不可能，因为t3是下笔，t1也是下笔，中间隔着t2顶)
+                                # 通常缺口是指：t3 range is completely below t1 range.
+                                # t1: [min, max], t3: [min, max]
+                                # Gap exists if t3.max < t1.min
+                                if t3.max < t1.min: has_gap = True
                             else:
-                                peak = min(t2.lines, key=lambda b: b.low)
-                                fx_obj = XLFX("di", t2, [t1, t2, t3], True)
-                            # 记录缺口与形态信息
-                            fx_obj.qk = has_gap
-                            fx_obj.is_line_bad = False
-
-                            end_idx = peak.index
-                            end_bi = self.bis[end_idx]
+                                # 向下线段，特征序列(上笔)找底分型
+                                # 第一元素(t1)与第三元素(t3)无重叠
+                                # 底分型，t2低点最低。
+                                # Gap exists if t3.min > t1.max
+                                if t3.min > t1.max: has_gap = True
                             
-                            # 创建线段
-                            xd = XD(
-                                start_bi.start,
-                                end_bi.end,
-                                start_bi,
-                                end_bi,
-                                xd_dir,
-                                fx_obj if xd_dir == "up" else None,
-                                fx_obj if xd_dir == "down" else None,
-                                len(self.xds),
-                            )
+                            # 破坏确认 (Break Condition)
+                            break_condition = False
                             if xd_dir == "up":
-                                xd.high = end_bi.end.val
-                                xd.low = start_bi.start.val
+                                if t3.min < t1.min: break_condition = True
                             else:
-                                xd.high = start_bi.start.val
-                                xd.low = end_bi.end.val
-                            xd.done = True
-                            self.xds.append(xd)
+                                if t3.max > t1.max: break_condition = True
                             
-                            made = True
-                            start_idx = peak.index # 下一段从峰值笔开始
+                            is_valid = False
+                            if has_gap:
+                                # 有缺口，当下成立 (Standard: Gap -> Valid immediately)
+                                is_valid = True
+                            else:
+                                # 无缺口，需确认 (Standard: No Gap -> Need Confirmation)
+                                # 这里的确认通常指：后续走势不能收回分型区间，或者t3力度足够大
+                                # 简化处理：如果满足 break_condition (即 t3 突破了 t1 的极值)，则视为有效
+                                if break_condition: is_valid = True
+                            
+                            if is_valid:
+                                # 找到分型顶点
+                                if xd_dir == "up":
+                                    peak = max(t2.lines, key=lambda b: b.high)
+                                    fx_obj = XLFX("ding", t2, [t1, t2, t3], True)
+                                else:
+                                    peak = min(t2.lines, key=lambda b: b.low)
+                                    fx_obj = XLFX("di", t2, [t1, t2, t3], True)
+                                fx_obj.qk = has_gap
+                                fx_obj.is_line_bad = False
+
+                                # 线段结束点：极值笔的前一笔
+                                # peak 是特征序列的元素（反向笔）。
+                                # 向上线段结束于 Peak(下笔) 的起始点。
+                                # Peak 的起始点是前一笔(上笔) 的结束点。
+                                end_bi_idx = peak.index - 1
+                                if end_bi_idx < start_idx: continue # 异常保护
+                                
+                                end_bi = self.bis[end_bi_idx]
+                                
+                                xd = XD(
+                                    start_bi.start,
+                                    end_bi.end,
+                                    start_bi,
+                                    end_bi,
+                                    xd_dir,
+                                    fx_obj if xd_dir == "up" else None,
+                                    fx_obj if xd_dir == "down" else None,
+                                    len(self.xds)
+                                )
+                                if xd_dir == "up":
+                                    xd.high = end_bi.end.val
+                                    xd.low = start_bi.start.val
+                                else:
+                                    xd.high = start_bi.start.val
+                                    xd.low = end_bi.end.val
+                                xd.done = True
+                                self.xds.append(xd)
+                                
+                                # 下一段从 Peak 笔开始
+                                start_idx = peak.index
+                                made = True
+                                break
+                
+                current_search_idx += 1
+            
+            if made:
+                continue
+            
+            # 如果遍历完所有笔都没生成线段
+            # 尝试策略：
+            # 1. 检查是否可以延伸上一线段（即假突破/震荡后延续原趋势）
+            # 2. 如果无法延伸，再考虑强制分段（防止死循环）
+            
+            extension_success = False
+            if len(self.xds) > 0:
+                last_xd = self.xds[-1]
+                # 向后搜索一定范围，看是否有创新高/新低的笔
+                search_limit = min(len(self.bis), start_idx + 100)
+                
+                if last_xd.type == "up":
+                    # 上涨线段，寻找更高点
+                    for k in range(start_idx, search_limit):
+                        # 必须是同向笔（Up笔）创新高才算有效延伸
+                        if self.bis[k].type == "up" and self.bis[k].high > last_xd.high:
+                            # 找到新高，说明之前的线段结束是误判（或者行情延续）
+                            # 延伸上一线段
+                            last_xd.high = self.bis[k].high
+                            last_xd.end = self.bis[k].end
+                            last_xd.end_line = self.bis[k]
+                            
+                            # 重置搜索起点为新高点的下一笔
+                            start_idx = k + 1
+                            extension_success = True
+                            break
+                else:
+                    # 下跌线段，寻找更低点
+                    for k in range(start_idx, search_limit):
+                        # 必须是同向笔（Down笔）创新低才算有效延伸
+                        if self.bis[k].type == "down" and self.bis[k].low < last_xd.low:
+                            # 找到新低，延伸
+                            last_xd.low = self.bis[k].low
+                            last_xd.end = self.bis[k].end
+                            last_xd.end_line = self.bis[k]
+                            
+                            start_idx = k + 1
+                            extension_success = True
                             break
             
-            if bi_pohuai_done:
+            if extension_success:
                 continue
 
-            if not made:
-                # 生成未完成线段（到当前同向最后一笔）
-                if last_same.index > start_bi.index + 1:
-                    xd = XD(start_bi.start, last_same.end, start_bi, last_same, xd_dir, None, None, len(self.xds))
-                    if xd_dir == "up":
-                        xd.high = last_same.end.val
-                        xd.low = start_bi.start.val
-                    else:
-                        xd.high = start_bi.start.val
-                        xd.low = last_same.end.val
-                    xd.done = False
-                    self.xds.append(xd)
-                    # 结束所有计算，因为已经到了最后
-                    break
+            # 1. 如果剩余笔数不多，可能是真的未完成，直接退出处理未完成逻辑
+            if len(self.bis) - start_idx < 20:
+                break
+            
+            # 2. 如果剩余笔数很多，且无法延伸，说明可能是复杂震荡
+            # 为了防止后续线段全部丢失，进行“强制分段”容错处理
+            # 策略：在后续的一段范围内（例如20笔），寻找当前方向的极值点，强制结束
+            
+            search_range = min(len(self.bis), start_idx + 30)
+            candidates = self.bis[start_idx:search_range]
+            
+            if xd_dir == "up":
+                # 向上线段，找最高点强制结束
+                best_bi = max(candidates, key=lambda b: b.high)
+            else:
+                # 向下线段，找最低点强制结束
+                best_bi = min(candidates, key=lambda b: b.low)
+            
+            # 强制生成线段
+            # 注意：best_bi 必须是同向的。如果是反向的，取其前一笔（同向）
+            if best_bi.type != xd_dir:
+                # 这种情况很少见，因为 max/min 会找到极值。
+                # 如果极值笔恰好是反向笔（例如向上线段中，一个反向笔的高点比同向笔还高？不可能，同向笔肯定连接更高的位置）
+                # 除非是包含关系。
+                # 简单起见，如果 best_bi 是反向，回退到前一笔
+                if best_bi.index > start_idx:
+                    best_bi = self.bis[best_bi.index - 1]
+            
+            # 确保 best_bi 在 start_bi 之后
+            if best_bi.index <= start_idx:
+                 # 实在找不到，强制前移，避免死循环
+                 start_idx += 1
+                 continue
+
+            xd = XD(
+                start_bi.start,
+                best_bi.end,
+                start_bi,
+                best_bi,
+                xd_dir,
+                None,
+                None,
+                len(self.xds)
+            )
+            if xd_dir == "up":
+                xd.high = best_bi.end.val
+                xd.low = start_bi.start.val
+            else:
+                xd.high = start_bi.start.val
+                xd.low = best_bi.end.val
+            
+            # 标记为强制分段
+            xd.done = True
+            xd.is_split = "force" 
+            self.xds.append(xd)
+            
+            # 下一段从强制结束点的下一笔开始（反向）
+            start_idx = best_bi.index + 1
+            # 此时必须确保下一笔是反向的，理论上笔是交替的，所以 best_bi(同向) 的下一笔一定是反向
+            continue
+        
+        # 处理未完成线段
+        if len(self.xds) > 0:
+            last_xd = self.xds[-1]
+            # 从上一线段结束位置开始，到最后一笔
+            # 注意 start_idx 已经被更新为上一线段结束位置的下一笔（即新段开始）
+            if start_idx < len(self.bis):
+                last_bi = self.bis[-1]
+                
+                # 确保方向正确
+                # 此时 start_idx 对应的笔应该是反向的
+                # 如果不是，说明已经在上面的循环中被跳过或合并了，这里 start_idx 指向的一定是反向笔或者列表末尾
+                
+                # 如果剩余笔数太少，或者没有构成反向趋势？
+                # 无论如何，剩余部分作为未完成段
+                
+                xd_dir = "down" if last_xd.type == "up" else "up"
+                # 检查 start_idx 的笔是否匹配方向，如果不匹配（理论上不会，因为上面的循环保证了 start_idx 指向反向笔或结束），
+                # 但如果最后几笔都是同向的延伸，它们会在上面被合并。
+                # 所以这里直接连接即可。
+                
+                start_bi = self.bis[start_idx]
+                # 简单检查方向，如果不匹配，可能需要调整 start_idx (虽然逻辑上应该匹配)
+                if start_bi.type != xd_dir:
+                    # 这种情况可能是：最后几笔是同向的，但是没有创新高/新低（未合并），被跳过了。
+                    # 比如 Up段结束，后面是 Down(不创新低), Up, Down...
+                    # 应该找到第一个符合方向的笔？
+                    # 或者直接取 start_idx？
+                    # 既然是未完成，我们假设它延续到最后。
+                    pass
+
+                xd = XD(start_bi.start, last_bi.end, start_bi, last_bi, xd_dir, None, None, len(self.xds))
+                if xd_dir == "up":
+                    xd.high = max([b.high for b in self.bis[start_idx:]])
+                    xd.low = start_bi.start.val
                 else:
-                    # 无法构成线段 (如笔数不足)，尝试下一个笔作为起点
-                    start_idx += 1
+                    xd.high = start_bi.start.val
+                    xd.low = min([b.low for b in self.bis[start_idx:]])
+                xd.done = False
+                self.xds.append(xd)
+        else:
+            # 一根线段都没生成，创建一个未完成的
+            if len(self.bis) > 0:
+                xd = XD(self.bis[0].start, self.bis[-1].end, self.bis[0], self.bis[-1], self.bis[0].type, None, None, 0)
+                if xd.type == "up":
+                    xd.high = max([b.high for b in self.bis])
+                    xd.low = self.bis[0].start.val
+                else:
+                    xd.high = self.bis[0].start.val
+                    xd.low = min([b.low for b in self.bis])
+                xd.done = False
+                self.xds.append(xd)
 
 
     def _cal_zsd(self):
