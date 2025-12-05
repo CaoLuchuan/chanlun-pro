@@ -671,6 +671,20 @@ class CL(ICL):
                              if start_fx.type == "di" and check_fx.val <= start_fx.val:
                                  break # start_fx 被延伸
                         
+                        # 4. 处理方向改变的毛刺（Top -> Bottom -> Top -> Top）
+                        # 如果 check_fx 与 start_fx 同向（即与 next_fx 反向），但没有更极端
+                        # 且它也不能与 next_fx 成笔（条件2已检查）
+                        # 这说明 next_fx -> check_fx 是一个无效的波动（毛刺）
+                        # 我们需要继续往后看，看是否有更极端的点来延伸 start_fx，或者有新的 valid 结构
+                        # 这里不需要 break，继续循环即可。
+                        
+                        # 但有一个特殊情况：如果 check_fx 虽然没更极端，但后续紧接着一个同向点更极端了呢？
+                        # 例如：Start(Top) -> Next(Bottom, Valid) -> Check1(Top, Invalid) -> Check2(Top, > Start)
+                        # 这种情况下，Next 应该是无效的，Start 应该直接连到 Check2。
+                        # 这里的逻辑已经在 Case 3 中涵盖了：只要 Check2 > Start，就会 break 并判定 Start 被延伸。
+                        # 所以关键是：在遇到 Check2 之前，不要误判 Next 是有效的。
+                        # 当前逻辑：如果没有遇到 valid next pen，循环会继续，直到遇到 Case 3 (break, not confirm) 或 Case 2 (confirm)
+                        
                         check_idx += 1
                     
                     # 如果遍历完都没找到确认笔，且没有被延伸，说明后续震荡收敛或数据结束
