@@ -656,18 +656,20 @@ class CL(ICL):
                             if next_fx.type == "di" and check_fx.val <= next_fx.val:
                                 break # next_fx 被延伸，当前不成笔
                         
-                        # 2. 如果遇到反向分型（与 next_fx 反向，即与 start_fx 同向），且更极端，说明 start_fx 会延伸，当前笔无效
-                        # 这种情况在 _cal_bi 主循环的 "Check 1" 中处理，但在 Lookahead 中也需要判断
+                        # 2. 检查能否成笔 (优先检查反向笔确认)
+                        # 如果能形成有效的下一笔，则当前笔得到确认
+                        if self.check_bi_valid(next_fx, check_fx, bi_type):
+                            is_confirm = True
+                            break
+
+                        # 3. 如果遇到反向分型（与 next_fx 反向，即与 start_fx 同向），且更极端
+                        # 并且此时还没有形成有效的下一笔（否则上面就break了）
+                        # 说明 start_fx 会延伸，当前笔无效
                         if check_fx.type == start_fx.type:
                              if start_fx.type == "ding" and check_fx.val >= start_fx.val:
                                  break # start_fx 被延伸
                              if start_fx.type == "di" and check_fx.val <= start_fx.val:
                                  break # start_fx 被延伸
-
-                        # 3. 检查能否成笔
-                        if self.check_bi_valid(next_fx, check_fx, bi_type):
-                            is_confirm = True
-                            break
                         
                         check_idx += 1
                     
