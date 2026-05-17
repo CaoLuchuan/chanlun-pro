@@ -23,14 +23,5 @@ if not exist "%ROOT_DIR%src\chanlun\config.py" (
     copy "%ROOT_DIR%src\chanlun\config.py.demo" "%ROOT_DIR%src\chanlun\config.py" >nul
 )
 
-echo 4. 设置环境变量
-set "PYTHONPATH=%ROOT_DIR%src"
-echo 设置PYTHONPATH: !PYTHONPATH!
-
-echo 5. 运行环境检查脚本
-if exist "%ROOT_DIR%check_env.py" (
-    %UV_DIR% run "%ROOT_DIR%check_env.py"
-)
-
 echo 环境配置完成！
 pause

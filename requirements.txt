@@ -24,6 +24,7 @@ ipywidgets
 pinyin
 pyarmor
 setuptools
+scipy
 
 futu-api
 ccxt==4.5.22

@@ -92,6 +92,12 @@ class ExchangeQMT(Exchange):
         """
         return []
 
+    def quote_markets(self) -> List[str]:
+        """
+        返回整市场订阅所需的 QMT 市场列表，默认由子类实现。
+        """
+        return []
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_random(min=1, max=5),
@@ -324,7 +330,7 @@ class ExchangeQMT(Exchange):
         df["divid_date"] = pd.to_datetime(df["time"] / 1000, unit="s")
         return df
 
-    def subscribe_all_ticks(self, callback):
+    def subscribe_all_ticks(self, callback, market_list: List[str] = None):
         all_stocks = self.all_stocks()
         all_codes = [_s["code"] for _s in all_stocks]
 
@@ -335,8 +341,11 @@ class ExchangeQMT(Exchange):
                     continue
                 callback(_tdx_code, _tick)
 
-        # 订阅逻辑需要子类提供 market list
-        pass
+        markets = market_list or self.quote_markets()
+        if len(markets) == 0:
+            raise Exception("未提供 QMT 行情订阅市场列表")
+        xtdata.subscribe_whole_quote(markets, on_tick)
+        xtdata.run()
 
     def subscribe_stocks_quotes(self, codes: List[str], callback):
         """

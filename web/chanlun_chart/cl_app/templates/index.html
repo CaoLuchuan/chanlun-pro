@@ -331,6 +331,8 @@
       fx_interval_2: "1D",
       futures_interval_1: "1D",
       futures_interval_2: "1D",
+      option_interval_1: "1D",
+      option_interval_2: "1D",
       ny_futures_interval_1: "1D",
       ny_futures_interval_2: "1D",
       currency_interval_1: "1D",
@@ -343,6 +345,7 @@
       us_code: "{{ market_default_codes.us }}",
       fx_code: "{{ market_default_codes.fx }}",
       futures_code: "{{ market_default_codes.futures }}",
+      option_code: "{{ market_default_codes.option }}",
       ny_futures_code: "{{ market_default_codes.ny_futures }}",
       currency_code: "{{ market_default_codes.currency }}",
       currency_spot_code: "{{ market_default_codes.currency_spot }}",
@@ -379,12 +382,14 @@
   <script src="{{ url_for('static', filename='js/tv_indicators/chart_idx_vegasma.js') }}"></script>
   <script src="{{ url_for('static', filename='js/tv_indicators/chart_idx_vol.js') }}"></script>
   <script src="{{ url_for('static', filename='js/tv_indicators/chart_idx_zhixing.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/tv_indicators/chart_idx_rsx.js') }}"></script>
   <script src="{{ url_for('static', filename='js/tv_indicators/chart_idx_dpo.js') }}"></script>
   <script src="{{ url_for('static', filename='js/tv_indicators/chart_idx_cci.js') }}"></script>
   <script src="{{ url_for('static', filename='js/tv_indicators/chart_idx_obv.js') }}"></script>
   <script src="{{ url_for('static', filename='js/tv_indicators/chart_idx_roc.js') }}"></script>
   <script src="{{ url_for('static', filename='js/tv_indicators/chart_idx_asi.js') }}"></script>
   <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/ai_prediction.js') }}"></script>
   <script src="{{ url_for('static', filename='js/zixuan.js') }}"></script>
   <script src="{{ url_for('static', filename='js/alert.js') }}"></script>
   <script src="{{ url_for('static', filename='js/ai.js') }}"></script>
@@ -426,6 +431,12 @@
               templet:
                 '<div><i class="layui-icon layui-icon-speaker"></i> <span>新增监控</span></div>',
               id: 4,
+            },
+            {
+              title: "运行选股",
+              templet:
+                '<div><i class="layui-icon layui-icon-search"></i> <span>运行选股</span></div>',
+              id: 5,
             },
             {
               title: "当前任务",

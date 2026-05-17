@@ -44,7 +44,7 @@ class AlertTasks(object):
                         minute=f"*/{_t.interval_minutes}",
                         second="0",
                         coalesce=True,
-                        misfire_grace_time=60,
+                        misfire_grace_time=30,
                         max_instances=2,
                     )
                 else:
@@ -60,7 +60,7 @@ class AlertTasks(object):
                         minute="0",
                         second="0",
                         coalesce=True,
-                        misfire_grace_time=60,
+                        misfire_grace_time=30,
                         max_instances=2,
                     )
 
