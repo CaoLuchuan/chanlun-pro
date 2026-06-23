@@ -1281,6 +1281,7 @@ def create_app(test_config=None):
                     "check_idx_zhixing_info_price_cross_long_up": check_idx_zhixing_info.get("price_cross_long_up", 0),
                     "check_idx_zhixing_info_price_cross_long_down": check_idx_zhixing_info.get("price_cross_long_down", 0),
                     "is_send_msg": _alert_config.is_send_msg,
+                    "is_send_img": _alert_config.is_send_img if hasattr(_alert_config, "is_send_img") and _alert_config.is_send_img is not None else 0,
                     "is_run": _alert_config.is_run,
                 }
 

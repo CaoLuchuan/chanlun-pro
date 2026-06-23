@@ -17,11 +17,27 @@ class FakeCompletions:
         return SimpleNamespace(choices=[SimpleNamespace(message=FakeMessage())])
 
 
+class FakeStringCompletions:
+    def __init__(self):
+        self.kwargs = None
+
+    def create(self, **kwargs):
+        self.kwargs = kwargs
+        return "raw string response"
+
+
 class FakeClient:
     def __init__(self, api_key, base_url):
         self.api_key = api_key
         self.base_url = base_url
         self.chat = SimpleNamespace(completions=FakeCompletions())
+
+
+class FakeStringClient:
+    def __init__(self, api_key, base_url):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.chat = SimpleNamespace(completions=FakeStringCompletions())
 
 
 def test_resolve_ai_config_prefers_unified_config_and_provider_url():
@@ -101,3 +117,33 @@ def test_request_ai_model_reports_missing_config():
     assert result["ok"] is False
     assert "未正确配置" in result["msg"]
     assert result["model"] == ""
+
+
+def test_resolve_ai_config_normalizes_openrouter_root_url():
+    cfg = SimpleNamespace(
+        AI_PROVIDER="openrouter",
+        AI_API_URL="https://openrouter.ai",
+        AI_API_KEY="key",
+        AI_MODEL="deepseek/deepseek-v4-flash",
+    )
+
+    ai_config = resolve_ai_config(cfg)
+
+    assert ai_config.api_url == "https://openrouter.ai/api/v1"
+
+
+def test_request_ai_model_accepts_string_response():
+    cfg = SimpleNamespace(
+        AI_PROVIDER="openrouter",
+        AI_API_URL="https://openrouter.ai",
+        AI_API_KEY="key",
+        AI_MODEL="model-a",
+    )
+
+    result = request_ai_model(
+        "hello",
+        config_module=cfg,
+        client_factory=FakeStringClient,
+    )
+
+    assert result == {"ok": True, "msg": "raw string response", "model": "model-a"}

@@ -560,11 +560,14 @@ def monitoring_code(
 
     # 沪深A股，增加行业概念信息
     if market == "a" and len(send_msgs) > 0:
-        hygn = ex.stock_owner_plate(code)
-        if len(hygn["HY"]) > 0:
-            send_msgs.append("行业 : " + "/".join([_["name"] for _ in hygn["HY"]]))
-        if len(hygn["GN"]) > 0:
-            send_msgs.append("概念 : " + "/".join([_["name"] for _ in hygn["GN"]]))
+        try:
+            hygn = ex.stock_owner_plate(code)
+            if len(hygn["HY"]) > 0:
+                send_msgs.append("行业 : " + "/".join([_["name"] for _ in hygn["HY"]]))
+            if len(hygn["GN"]) > 0:
+                send_msgs.append("概念 : " + "/".join([_["name"] for _ in hygn["GN"]]))
+        except Exception:
+            pass
 
     # 添加图片
     # 如果 is_send_img 为 None，则使用全局配置

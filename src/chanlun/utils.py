@@ -133,17 +133,18 @@ def send_fs_msg(market, title, contents: Union[str, list]):
         msg_content = {
             "zh_cn": {
                 "title": title,
-                "content": [[]],
+                "content": [],
             }
         }
         for _c in contents:
             if _c.startswith("img_"):  # 支持图片消息
-                msg_content["zh_cn"]["content"][0].append(
-                    {"tag": "img", "image_key": f"{_c}"}
+                # Feishu post 富文本要求图片独占一个段落，否则可能返回 success 但不显示图片
+                msg_content["zh_cn"]["content"].append(
+                    [{"tag": "img", "image_key": f"{_c}"}]
                 )
             else:
-                msg_content["zh_cn"]["content"][0].append(
-                    {"tag": "text", "text": f"{_c} \n"}
+                msg_content["zh_cn"]["content"].append(
+                    [{"tag": "text", "text": f"{_c} \n"}]
                 )
 
     # 发送飞书消息（API）
