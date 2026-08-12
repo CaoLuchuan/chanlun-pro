@@ -233,6 +233,8 @@ class ChartManager {
       TvIdxOBV.idx(PineJS),
       TvIdxROC.idx(PineJS),
       TvIdxASI.idx(PineJS),
+      TvIdxTLZMACD.idx(PineJS),
+      TvIdxLevelMA.idx(PineJS),
     ]);
   }
 

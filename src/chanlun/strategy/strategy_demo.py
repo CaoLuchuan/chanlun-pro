@@ -1,18 +1,21 @@
 from typing import Dict, List, Union
 
 from chanlun.backtesting.base import POSITION, MarketDatas, Operation, Strategy
-from chanlun.cl_interface import BI
+from chanlun.cl_interface import BI, CLLevel
 
 
 class StrategyDemo(Strategy):
     """
-    策略Demo
+    策略Demo（支持级别过滤）
     """
 
     def __init__(self):
         super().__init__()
 
         self._max_loss_rate = None  # 最大亏损比例设置
+        # 级别过滤：只操作指定级别及以上的信号（None=不过滤）
+        # 可选值：'purple','white','blue','green','red','yellow'
+        self._min_level = 'white'  # 默认只操作白色级别及以上
 
     def open(
         self, code, market_data: MarketDatas, poss: Dict[str, POSITION]
@@ -35,6 +38,12 @@ class StrategyDemo(Strategy):
         # 笔没有买卖点，退出
         if len(bi_now.line_mmds()) == 0:
             return opts
+
+        # 级别过滤：只操作指定级别及以上的信号
+        if self._min_level is not None:
+            bi_level = getattr(bi_now, 'level', None)
+            if bi_level is None or not CLLevel.is_at_least(bi_level, self._min_level):
+                return opts
 
         # 笔没有停顿，退出
         if self.bi_td(bi_now, data_now) is False:
@@ -72,8 +81,8 @@ class StrategyDemo(Strategy):
                     opt="buy",
                     mmd=mmd,
                     loss_price=loss_price,
-                    msg="当前级别 (MMD: %s Loss: %s) "
-                    % (bi_now.line_mmds(), loss_price),
+                    msg="当前级别 (LV:%s MMD: %s Loss: %s) "
+                    % (getattr(bi_now, 'level_cn', '未知'), bi_now.line_mmds(), loss_price),
                     info={
                         "fx_datetime": bi_now.end.k.date,
                         "cl_datas": {

@@ -85,6 +85,7 @@ def render_charts(
         "chart_show_zsd_bc": True,
         "chart_show_qsd_bc": True,
         "chart_show_ma": True,
+        "chart_show_level_ma": False,  # 趋势浪子双倍均线体系（级别均线）
         "chart_show_ama": True,
         "chart_show_boll": False,
         "chart_show_futu": "macd",
@@ -993,6 +994,34 @@ def render_charts(
                     .set_global_opts()
                 )
             )
+    if config.get("chart_show_level_ma", False):
+        # 趋势浪子双倍均线体系：10/20/40/80/160/320
+        from chanlun.cl_interface import CLLevel
+
+        level_ma_periods = [10, 20, 40, 80, 160, 320]
+        level_names = ["purple", "white", "blue", "green", "red", "yellow"]
+        close_arr = np.array(klines["close"].tolist())
+        for i, period in enumerate(level_ma_periods):
+            if len(close_arr) < period:
+                continue
+            ma_vals = talib.MA(close_arr, timeperiod=period)
+            level_code = level_names[i]
+            level_cn = CLLevel.get_cn(level_code)
+            color = CLLevel.get_color(level_code)
+            overlap_kline = overlap_kline.overlap(
+                (
+                    Line()
+                    .add_xaxis(xaxis_data=klines_xaxis)
+                    .add_yaxis(
+                        series_name=f"LV{period}({level_cn})",
+                        is_symbol_show=False,
+                        y_axis=ma_vals,
+                        linestyle_opts=opts.LineStyleOpts(width=1, color=color),
+                        label_opts=opts.LabelOpts(is_show=False),
+                    )
+                    .set_global_opts()
+                )
+            )
     if config["chart_show_ama"]:
         # 计算ma线
         ama_ags = config["chart_idx_ama_ags"].split(",")[0:3]
@@ -1624,6 +1653,98 @@ def render_charts(
             )
         )
         futu_charts.append(kdj_line)
+    elif config["chart_show_futu"] == "tlz_macd":
+        # 趋势浪子专用 MACD（参数 10/20/5，基于双倍均线体系）
+        # fast=10, slow=20, signal=5
+        # 零轴 = 拉直的 EMA20（白色级别核心均线，本级别分水岭）
+        # DIF = EMA(close, 10) - EMA(close, 20)  快线：10日与20日均线的差值
+        # DEA = EMA(DIF, 5)                       信号线：对DIF取5日加权平滑（M值）
+        # HIST = (DIF - DEA) * 2                  能量柱：快慢线差值的2倍放大
+        close_arr = np.array(klines["close"].tolist())
+        ema10 = talib.EMA(close_arr, timeperiod=10)
+        ema20 = talib.EMA(close_arr, timeperiod=20)
+        tlz_dif = ema10 - ema20
+        tlz_dea = talib.EMA(tlz_dif, timeperiod=5)
+        tlz_hist = (tlz_dif - tlz_dea) * 2
+
+        bar_tlz_macd = (
+            Bar()
+            .add_xaxis(xaxis_data=klines_xaxis)
+            .add_yaxis(
+                series_name="TLZ_HIST",
+                y_axis=list(tlz_hist),
+                label_opts=opts.LabelOpts(is_show=False),
+                itemstyle_opts=opts.ItemStyleOpts(
+                    color=JsCode(
+                        "function(p){var c;if (p.data >= 0) {c = '#ef232a';} else {c = '#14b143';}return c;}"
+                    )
+                ),
+            )
+            .set_global_opts(
+                legend_opts=opts.LegendOpts(is_show=False),
+                xaxis_opts=opts.AxisOpts(
+                    axislabel_opts=opts.LabelOpts(is_show=False),
+                    splitline_opts=opts.SplitLineOpts(is_show=False),
+                ),
+                yaxis_opts=opts.AxisOpts(
+                    position="right",
+                    axislabel_opts=opts.LabelOpts(is_show=False),
+                    axisline_opts=opts.AxisLineOpts(is_show=False),
+                    axistick_opts=opts.AxisTickOpts(is_show=False),
+                    splitline_opts=opts.SplitLineOpts(is_show=False),
+                ),
+            )
+        )
+
+        line_tlz_macd = (
+            Line()
+            .add_xaxis(xaxis_data=klines_xaxis)
+            .add_yaxis(
+                series_name="TLZ_DIF",
+                y_axis=tlz_dif,
+                is_symbol_show=False,
+                label_opts=opts.LabelOpts(is_show=False),
+                itemstyle_opts=opts.ItemStyleOpts(color="white"),
+            )
+            .add_yaxis(
+                series_name="TLZ_DEA",
+                y_axis=tlz_dea,
+                is_symbol_show=False,
+                label_opts=opts.LabelOpts(is_show=False),
+                itemstyle_opts=opts.ItemStyleOpts(color="yellow"),
+            )
+            .set_global_opts(
+                legend_opts=opts.LegendOpts(is_show=True),
+                xaxis_opts=opts.AxisOpts(
+                    axislabel_opts=opts.LabelOpts(is_show=False),
+                ),
+                yaxis_opts=opts.AxisOpts(
+                    position="right",
+                    axislabel_opts=opts.LabelOpts(is_show=False),
+                    axisline_opts=opts.AxisLineOpts(is_show=False),
+                    axistick_opts=opts.AxisTickOpts(is_show=False),
+                ),
+            )
+        )
+
+        # 零轴加粗显示（本级别分水岭 = 拉直的EMA20，白色级别核心均线）
+        line_tlz_zero = (
+            Line()
+            .add_xaxis(xaxis_data=klines_xaxis)
+            .add_yaxis(
+                series_name="零轴",
+                y_axis=[0] * len(klines_xaxis),
+                is_symbol_show=False,
+                label_opts=opts.LabelOpts(is_show=False),
+                linestyle_opts=opts.LineStyleOpts(width=2, color="#888888"),
+            )
+            .set_global_opts()
+        )
+
+        tlz_macd_bar_line = bar_tlz_macd.overlap(line_tlz_macd).overlap(
+            line_tlz_zero
+        )
+        futu_charts[0] = tlz_macd_bar_line
     elif config["chart_show_futu"] == "custom":
         pass
 

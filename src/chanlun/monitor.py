@@ -21,7 +21,7 @@ from playwright.sync_api import sync_playwright
 
 from chanlun import config, fun, kcharts
 from chanlun.backtesting.base import Strategy
-from chanlun.cl_interface import ICL
+from chanlun.cl_interface import ICL, CLLevel
 from chanlun.cl_utils import bi_td, web_batch_get_cl_datas
 from chanlun.db import db
 from chanlun.exchange import Market, get_exchange
@@ -118,6 +118,20 @@ def monitoring_code(
         "3sell": "三卖点",
         "l3sell": "类三卖点",
     }
+    # 级别过滤配置
+    _min_level = cl_config.get("chart_min_level", "white") if cl_config else "white"
+    _min_level_idx = CLLevel.get_index(_min_level)
+    _min_fx_ld = cl_config.get("chart_min_fx_ld", 3) if cl_config else 3
+
+    def _level_ok(obj):
+        """检查对象级别是否 >= 最小级别"""
+        if _min_level_idx <= 0:
+            return True
+        lvl = getattr(obj, 'level', None)
+        if lvl is None:
+            return True
+        return CLLevel.get_index(lvl) >= _min_level_idx
+
     for cd in cl_datas:
         bis = cd.get_bis()
         frequency = cd.get_frequency()
@@ -125,6 +139,12 @@ def monitoring_code(
             continue
         end_bi = bis[-1]
         end_xd = cd.get_xds()[-1] if len(cd.get_xds()) > 0 else None
+        # 级别过滤：低于最小级别的笔不监控
+        if not _level_ok(end_bi):
+            continue
+        # 分型力度过滤：力度太小的不监控
+        if end_bi.end.ld() < _min_fx_ld:
+            continue
         # 检查背驰和买卖点
         if end_bi.type in check_cl_types["bi_types"]:
             jh_cl_msgs.extend(
@@ -139,6 +159,7 @@ def monitoring_code(
                     "k_date": cd.get_src_klines()[-1].date,
                     "k_index": cd.get_src_klines()[-1].index,
                     "line_type": end_bi.type,
+                    "level_cn": getattr(end_bi, 'level_cn', None),
                 }
                 for bc_type in check_cl_types["bi_beichi"]
                 if end_bi.bc_exists([bc_type], "|")
@@ -163,6 +184,9 @@ def monitoring_code(
             )
 
         if end_xd:
+            # 级别过滤：低于最小级别的线段不监控
+            if not _level_ok(end_xd):
+                continue
             # 检查背驰和买卖点
             if end_xd.type in check_cl_types["xd_types"]:
                 jh_cl_msgs.extend(
@@ -409,6 +433,11 @@ def monitoring_code(
                 price_info = f" 价格:{jh['xd'].end.val}"
 
             msg = f"触发 {jh['type']} ({is_done} - {is_td}{fx_ld}{price_info})"
+
+            # 增加级别标注
+            level_cn = jh.get('level_cn')
+            if level_cn:
+                msg = f"触发 {jh['type']} [LV:{level_cn}] ({is_done} - {is_td}{fx_ld}{price_info})"
             
             # 检查信号是否新鲜，如果是很久之前的信号（比如初始化加载时），则不发送消息，只记录
             is_fresh = True

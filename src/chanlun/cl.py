@@ -10,7 +10,7 @@ import talib
 from chanlun import cl_interface
 from chanlun import cl_utils
 from chanlun.cl_interface import (
-    ICL, Config, Kline, CLKline, FX, BI, XD, ZS, MMD, BC, LINE, TZXL, XLFX,
+    ICL, Config, CLLevel, Kline, CLKline, FX, BI, XD, ZS, MMD, BC, LINE, TZXL, XLFX,
     query_macd_ld, compare_ld_beichi, user_custom_mmd
 )
 from chanlun.cl_utils import cal_macd_bis_is_bc
@@ -205,6 +205,7 @@ class CL(ICL):
         self._cal_zsd()
         self._cal_zs()
         self._cal_mmd_bc()
+        self._cal_levels()
 
         return self
 
@@ -2819,6 +2820,192 @@ class CL(ICL):
             else:
                 i += 1
         return zss
+
+    def _cal_levels(self):
+        """
+        基于趋势浪子双倍均线体系，为所有分型、笔、线段、中枢标注级别
+
+        级别定位规则：
+        - 计算每个K线位置的各级别均线值
+        - 价格在哪个均线下方，就属于哪个级别
+        - 分型级别 = 分型K线所在位置的级别
+        - 笔级别 = 笔起始分型和结束分型中较大的级别
+        - 线段级别 = 线段起始笔和结束笔中较大的级别
+        - 中枢级别 = 中枢内所有笔的最大级别
+        """
+        if not self.config.get('cl_level_enable', True):
+            return
+
+        if len(self.klines) == 0:
+            return
+
+        close_prices = np.array([k.c for k in self.klines])
+        ma_periods = self.config.get('cl_level_ma_periods', [10, 20, 40, 80, 160, 320])
+        level_names = self.config.get('cl_level_names',
+            ['purple', 'white', 'blue', 'green', 'red', 'yellow'])
+
+        # 计算各级别均线
+        ma_values = {}
+        for period in ma_periods:
+            if len(close_prices) >= period:
+                ma_values[period] = talib.SMA(close_prices, period)
+            else:
+                ma_values[period] = np.full(len(close_prices), np.nan)
+
+        def get_kline_level(k_idx: int):
+            """
+            根据K线在均线中的位置确定级别
+            返回 (level_code, level_cn, level_ma)
+            价格在哪个均线下方，就属于哪个级别
+            """
+            if k_idx < 0 or k_idx >= len(close_prices):
+                return None, None, 0
+            price = close_prices[k_idx]
+            for i, period in enumerate(ma_periods):
+                ma_val = ma_values[period][k_idx]
+                if not np.isnan(ma_val) and price <= ma_val:
+                    level_code = level_names[i]
+                    return level_code, CLLevel.get_cn(level_code), float(ma_val)
+            # 价格在所有均线上方，取最高级别
+            last_period = ma_periods[-1]
+            last_ma = ma_values[last_period][k_idx]
+            level_code = level_names[-1]
+            ma_val = float(last_ma) if not np.isnan(last_ma) else 0
+            return level_code, CLLevel.get_cn(level_code), ma_val
+
+        def pick_bigger_level(lvl_a, lvl_b):
+            """取两个级别中较大的，返回 (level_code, level_cn, level_ma)"""
+            if lvl_a[0] is None:
+                return lvl_b
+            if lvl_b[0] is None:
+                return lvl_a
+            if CLLevel.get_index(lvl_b[0]) > CLLevel.get_index(lvl_a[0]):
+                return lvl_b
+            return lvl_a
+
+        def ensure_fx_level(fx_obj):
+            """
+            确保FX对象有level/level_cn/level_ma属性；如缺失则即时计算并回填。
+            返回 (level_code, level_cn, level_ma)
+            """
+            has_lvl = hasattr(fx_obj, 'level') and getattr(fx_obj, 'level', None) is not None
+            has_cn = hasattr(fx_obj, 'level_cn') and getattr(fx_obj, 'level_cn', None) is not None
+            has_ma = hasattr(fx_obj, 'level_ma')
+            if has_lvl and has_cn and has_ma:
+                return fx_obj.level, fx_obj.level_cn, getattr(fx_obj, 'level_ma', 0)
+            k_idx = fx_obj.k.k_index
+            code, cn, ma = get_kline_level(k_idx)
+            try:
+                fx_obj.level = code
+                fx_obj.level_cn = cn
+                fx_obj.level_ma = ma
+            except (AttributeError, TypeError):
+                pass
+            return code, cn, ma
+
+        def ensure_line_level(line_obj):
+            """
+            确保LINE(笔/线段)对象有level属性；如缺失则根据起止分型即时计算。
+            返回 (level_code, level_cn, level_ma)，无分型信息则返回 (None, None, 0)
+            """
+            has_lvl = hasattr(line_obj, 'level') and getattr(line_obj, 'level', None) is not None
+            has_cn = hasattr(line_obj, 'level_cn') and getattr(line_obj, 'level_cn', None) is not None
+            has_ma = hasattr(line_obj, 'level_ma')
+            if has_lvl and has_cn and has_ma:
+                return line_obj.level, line_obj.level_cn, getattr(line_obj, 'level_ma', 0)
+            try:
+                start_fx = line_obj.start
+                end_fx = line_obj.end
+                if start_fx is None or end_fx is None:
+                    return (None, None, 0)
+                s_lvl = ensure_fx_level(start_fx)
+                e_lvl = ensure_fx_level(end_fx)
+                lvl = pick_bigger_level(s_lvl, e_lvl)
+            except (AttributeError, TypeError):
+                return (None, None, 0)
+            try:
+                line_obj.level = lvl[0]
+                line_obj.level_cn = lvl[1]
+                line_obj.level_ma = lvl[2]
+            except (AttributeError, TypeError):
+                pass
+            return lvl
+
+        # 1. 标注分型级别（确保每个分型都有level属性）
+        for fx in self.fxs:
+            code, cn, ma = ensure_fx_level(fx)
+            fx.level = code
+            fx.level_cn = cn
+            fx.level_ma = ma
+
+        # 2. 标注笔级别（取起始和结束分型中较大的级别）
+        for bi in self.bis:
+            start_lvl = ensure_fx_level(bi.start)
+            end_lvl = ensure_fx_level(bi.end)
+            bi_level = pick_bigger_level(start_lvl, end_lvl)
+            bi.level = bi_level[0]
+            bi.level_cn = bi_level[1]
+            bi.level_ma = bi_level[2]
+
+        # 3. 标注线段级别
+        for xd in self.xds:
+            s_lvl = (None, None, 0)
+            e_lvl = (None, None, 0)
+            if xd.start_line:
+                s_lvl = ensure_line_level(xd.start_line)
+            if xd.end_line:
+                e_lvl = ensure_line_level(xd.end_line)
+            xd_level = pick_bigger_level(s_lvl, e_lvl)
+            xd.level = xd_level[0]
+            xd.level_cn = xd_level[1]
+            xd.level_ma = xd_level[2]
+
+        # 4. 标注走势段级别（同线段）
+        for zsd in self.zsds:
+            s_lvl = (None, None, 0)
+            e_lvl = (None, None, 0)
+            if zsd.start_line:
+                s_lvl = ensure_line_level(zsd.start_line)
+            if zsd.end_line:
+                e_lvl = ensure_line_level(zsd.end_line)
+            zsd_level = pick_bigger_level(s_lvl, e_lvl)
+            zsd.level = zsd_level[0]
+            zsd.level_cn = zsd_level[1]
+            zsd.level_ma = zsd_level[2]
+
+        # 5. 标注中枢级别（取中枢内所有线的最大级别）
+        for zs_dict in [self.bi_zss, self.xd_zss]:
+            for zs_list in zs_dict.values():
+                for zs in zs_list:
+                    max_lvl = (None, None, 0)
+                    for line in zs.lines:
+                        line_lvl = ensure_line_level(line)
+                        if line_lvl[0] is not None:
+                            max_lvl = pick_bigger_level(max_lvl, line_lvl)
+                    zs.cl_level = max_lvl[0]
+                    zs.cl_level_cn = max_lvl[1]
+                    zs.cl_level_ma = max_lvl[2]
+
+        # 6. 标注走势段中枢和趋势段中枢
+        for zs in self.zsd_zss:
+            max_lvl = (None, None, 0)
+            for line in zs.lines:
+                line_lvl = ensure_line_level(line)
+                if line_lvl[0] is not None:
+                    max_lvl = pick_bigger_level(max_lvl, line_lvl)
+            zs.cl_level = max_lvl[0]
+            zs.cl_level_cn = max_lvl[1]
+            zs.cl_level_ma = max_lvl[2]
+
+        for zs in self.qsd_zss:
+            max_lvl = (None, None, 0)
+            for line in zs.lines:
+                line_lvl = ensure_line_level(line)
+                if line_lvl[0] is not None:
+                    max_lvl = pick_bigger_level(max_lvl, line_lvl)
+            zs.cl_level = max_lvl[0]
+            zs.cl_level_cn = max_lvl[1]
+            zs.cl_level_ma = max_lvl[2]
 
 
 def create_cl(code: str, frequency: str, config: Union[dict, None] = None) -> CL:

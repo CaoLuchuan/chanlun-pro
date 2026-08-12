@@ -83,6 +83,97 @@ class Config(Enum):
     ZS_WZGX_ZGGDD = "zs_wzgx_zggdd"
     ZS_WZGX_GD = "zs_wzgx_gd"  # 判断两个中枢的位置关系，比较方式，gg与dd 严格比较
 
+    # 级别计算配置项（基于趋势浪子双倍均线体系）
+    CL_LEVEL_ENABLE = "cl_level_enable"  # 是否启用级别计算
+    CL_LEVEL_MA_PERIODS = "cl_level_ma_periods"  # 双倍均线周期列表
+    CL_LEVEL_NAMES = "cl_level_names"  # 级别名称列表
+
+
+class CLLevel:
+    """
+    缠论级别定义（基于趋势浪子双倍均线体系）
+
+    级别蕴含动能：级别越高，对应的资金体量和趋势力度越大。
+    级别定位规则：价格在哪个均线下方，就属于哪个级别。
+    """
+
+    # 级别代码 -> (中文解释, 核心均线周期, 形态学含义)
+    LEVELS = {
+        "purple": ("内部次级别", 10, "内部次级别波动，比'笔'更小的级别"),
+        "white":  ("本级别一笔", 20, "本级别的最小波动单位（一笔）"),
+        "blue":   ("中级别一笔", 40, "中级别波动，MACD零轴对应级别"),
+        "green":  ("大级别一笔", 80, "更大级别的一笔波动"),
+        "red":    ("线段级别",   160, "线段级别，主要操作级别"),
+        "yellow": ("趋势级别",   320, "走势类型级别，牛熊分界线"),
+    }
+
+    @staticmethod
+    def get_cn(level: str) -> str:
+        """获取级别的中文解释"""
+        info = CLLevel.LEVELS.get(level)
+        return info[0] if info else "未知级别"
+
+    @staticmethod
+    def get_ma_period(level: str) -> int:
+        """获取级别对应的核心均线周期"""
+        info = CLLevel.LEVELS.get(level)
+        return info[1] if info else 0
+
+    @staticmethod
+    def get_desc(level: str) -> str:
+        """获取级别的完整描述"""
+        info = CLLevel.LEVELS.get(level)
+        return info[2] if info else ""
+
+    @staticmethod
+    def get_level_by_index(idx: int) -> str:
+        """根据索引获取级别代码（0=purple, 1=white, ...）"""
+        levels = ["purple", "white", "blue", "green", "red", "yellow"]
+        if 0 <= idx < len(levels):
+            return levels[idx]
+        return "yellow"
+
+    @staticmethod
+    def get_index(level: str) -> int:
+        """获取级别的索引（用于比较大小，越大级别越高）"""
+        levels = ["purple", "white", "blue", "green", "red", "yellow"]
+        return levels.index(level) if level in levels else -1
+
+    @staticmethod
+    def is_at_least(level: str, min_level: str) -> bool:
+        """判断级别是否 >= 指定最小级别"""
+        return CLLevel.get_index(level) >= CLLevel.get_index(min_level)
+
+    # 级别对应的颜色（用于图表渲染）
+    LEVEL_COLORS = {
+        "purple": "#9932CC",  # 紫色
+        "white":  "#FFFFFF",  # 白色
+        "blue":   "#4169E1",  # 皇家蓝
+        "green":  "#008000",  # 绿色
+        "red":    "#FF0000",  # 红色
+        "yellow": "#FFD700",  # 黄色
+    }
+
+    @staticmethod
+    def get_color(level: str) -> str:
+        """获取级别对应的颜色代码（用于图表渲染）"""
+        return CLLevel.LEVEL_COLORS.get(level, "#888888")
+
+    @staticmethod
+    def filter_by_level(items, min_level: str = "white", attr: str = "level"):
+        """
+        过滤列表，只保留级别 >= min_level 的对象
+        :param items: 对象列表（FX/BI/XD 等）
+        :param min_level: 最小级别代码
+        :param attr: 级别属性名（FX/BI/XD 用 'level'，ZS 用 'cl_level'）
+        """
+        min_idx = CLLevel.get_index(min_level)
+        if min_idx < 0:
+            return items
+        return [item for item in items
+                if getattr(item, attr, None) and
+                CLLevel.get_index(getattr(item, attr)) >= min_idx]
+
 
 class Kline:
     """
@@ -169,6 +260,10 @@ class FX:
         self.val: float = val
         self.index: int = index
         self.done: bool = done  # 分型是否完成
+        # 级别属性（基于趋势浪子双倍均线体系）
+        self.level: str = None  # 级别代码，如 'white', 'blue', 'green', 'red', 'yellow'
+        self.level_cn: str = None  # 级别中文解释，如 '本级别一笔', '线段级别'
+        self.level_ma: float = 0  # 级别定级时的核心均线值
 
     def ld(self) -> int:
         """
@@ -336,6 +431,11 @@ class LINE:
         self.type: str = _type  # 线的方向类型 （up 上涨  down 下跌）
         self.index: int = index  # 线的索引，后续查找方便
 
+        # 级别属性（基于趋势浪子双倍均线体系）
+        self.level: str = None  # 级别代码，如 'white', 'blue', 'green', 'red', 'yellow'
+        self.level_cn: str = None  # 级别中文解释，如 '本级别一笔', '线段级别'
+        self.level_ma: float = 0  # 级别定级时的核心均线值
+
     @abstractmethod
     def is_done(self):
         """
@@ -412,6 +512,11 @@ class ZS:
 
         self.done = False  # 记录中枢是否完成
         self.real = True  # 记录是否是有效中枢
+
+        # 缠论级别属性（基于趋势浪子双倍均线体系）
+        self.cl_level: str = None  # 级别代码，如 'white', 'blue', 'green', 'red', 'yellow'
+        self.cl_level_cn: str = None  # 级别中文解释，如 '本级别一笔', '线段级别'
+        self.cl_level_ma: float = 0  # 级别定级时的核心均线值
 
     def add_line(self, line: LINE) -> bool:
         """

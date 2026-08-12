@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from chanlun import fun
-from chanlun.cl_interface import BI, FX, ICL, LINE, MACD_INFOS, ZS, Config, Kline
+from chanlun.cl_interface import BI, FX, ICL, LINE, MACD_INFOS, ZS, Config, Kline, CLLevel
 from chanlun.db import db
 from chanlun.exchange import exchange
 from chanlun.file_db import FileCacheDB
@@ -356,6 +356,10 @@ def query_cl_chart_config(
         "cl_mmd_cal_not_in_zs_gt_9_3mmd": "1",
         # 缠论高级配置
         "enable_kchart_low_to_high": "0",
+        # 级别计算配置（基于趋势浪子双倍均线体系）
+        "cl_level_enable": True,  # 是否启用级别计算
+        "cl_level_ma_periods": [10, 20, 40, 80, 160, 320],  # 双倍均线周期列表
+        "cl_level_names": ['purple', 'white', 'blue', 'green', 'red', 'yellow'],  # 级别名称
         # 画图默认配置
         "chart_show_infos": "0",
         "chart_show_fx": "0",
@@ -376,6 +380,9 @@ def query_cl_chart_config(
         "chart_show_zsd_bc": "1",
         "chart_show_qsd_bc": "1",
         "chart_show_ma": "0",
+        "chart_show_level_ma": "0",  # 趋势浪子双倍均线体系（级别均线）
+        "chart_min_level": "white",  # 前端展示最小级别（white=本级别一笔及以上）
+        "chart_min_fx_ld": 3,  # 前端分型最小力度（小于此值不展示分型）
         "chart_show_boll": "0",
         "chart_show_futu": "macd",
         "chart_show_atr_stop_loss": False,
@@ -696,9 +703,27 @@ def cl_data_to_tv_chart(
     kline_ls = klines["low"].tolist()
     kline_vs = klines["volume"].tolist()
 
+    # 级别过滤配置
+    _min_level = config.get("chart_min_level", "white")
+    _min_fx_ld = config.get("chart_min_fx_ld", 0)
+    _min_level_idx = CLLevel.get_index(_min_level)
+
+    def _level_ok(obj):
+        """检查对象级别是否 >= 最小级别"""
+        if _min_level_idx <= 0:
+            return True
+        lvl = getattr(obj, 'level', None)
+        if lvl is None:
+            return True  # 无级别信息不过滤
+        return CLLevel.get_index(lvl) >= _min_level_idx
+
     fx_data = []
     if config["chart_show_fx"] == "1":
         for fx in cd.get_fxs():
+            if not _level_ok(fx):
+                continue
+            if _min_fx_ld > 0 and fx.ld() < _min_fx_ld:
+                continue
             fx_data.append(
                 {
                     "points": [
@@ -706,12 +731,16 @@ def cl_data_to_tv_chart(
                         {"time": fun.datetime_to_int(fx.k.date), "price": fx.val},
                     ],
                     "text": fx.type,
+                    "level": getattr(fx, 'level', None),
+                    "level_cn": getattr(fx, 'level_cn', None),
                 }
             )
 
     bi_chart_data = []
     if config["chart_show_bi"] == "1":
         for bi in cd.get_bis():
+            if not _level_ok(bi):
+                continue
             bi_chart_data.append(
                 {
                     "points": [
@@ -726,12 +755,16 @@ def cl_data_to_tv_chart(
                     ],
                     "linestyle": "0" if bi.is_done() else "1",
                     "confirmed": getattr(bi, 'confirmed', True),
+                    "level": getattr(bi, 'level', None),
+                    "level_cn": getattr(bi, 'level_cn', None),
                 }
             )
 
     xd_chart_data = []
     if config["chart_show_xd"] == "1":
         for xd in cd.get_xds():
+            if not _level_ok(xd):
+                continue
             xd_chart_data.append(
                 {
                     "points": [
@@ -745,6 +778,8 @@ def cl_data_to_tv_chart(
                         },
                     ],
                     "linestyle": "0" if xd.is_done() else "1",
+                    "level": getattr(xd, 'level', None),
+                    "level_cn": getattr(xd, 'level_cn', None),
                 }
             )
 
@@ -784,6 +819,8 @@ def cl_data_to_tv_chart(
                             },
                         ],
                         "linestyle": "0" if zs.done else "1",
+                        "cl_level": getattr(zs, 'cl_level', None),
+                        "cl_level_cn": getattr(zs, 'cl_level_cn', None),
                     }
                 )
 
@@ -804,6 +841,8 @@ def cl_data_to_tv_chart(
                             },
                         ],
                         "linestyle": "0" if zs.done else "1",
+                        "cl_level": getattr(zs, 'cl_level', None),
+                        "cl_level_cn": getattr(zs, 'cl_level_cn', None),
                     }
                 )
 
@@ -853,6 +892,9 @@ def cl_data_to_tv_chart(
     }
     for line_type, ls in lines.items():
         for l in ls:
+            # 级别过滤：低于最小级别的线段不输出背驰/买卖点
+            if not _level_ok(l):
+                continue
             bcs = l.line_bcs("|")
             if len(bcs) != 0 and l.end.k.date not in bc_infos.keys():
                 bc_infos[l.end.k.date] = {
@@ -921,6 +963,18 @@ def cl_data_to_tv_chart(
     bc_chart_data.sort(key=lambda v: v["points"]["time"], reverse=False)
     mmd_chart_data.sort(key=lambda v: v["points"]["time"], reverse=False)
 
+    # 计算级别均线数据（趋势浪子双倍均线体系）
+    level_ma_data = {}
+    if config.get("chart_show_level_ma", False):
+        import talib as _talib
+        _close_prices = np.array(klines["close"].tolist())
+        for _period in [10, 20, 40, 80, 160, 320]:
+            if len(_close_prices) >= _period:
+                _ma_vals = _talib.MA(_close_prices, timeperiod=_period)
+                level_ma_data[f"MA{_period}"] = [
+                    float(v) if not np.isnan(v) else None for v in _ma_vals
+                ]
+
     return {
         "t": kline_ts,
         "c": kline_cs,
@@ -937,6 +991,7 @@ def cl_data_to_tv_chart(
         "zsd_zss": zsd_zs_chart_data,
         "bcs": bc_chart_data,
         "mmds": mmd_chart_data,
+        "level_ma": level_ma_data if config.get("chart_show_level_ma", False) else [],
     }
 
 
