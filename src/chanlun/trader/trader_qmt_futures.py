@@ -4,12 +4,22 @@ from typing import List
 from chanlun import utils, zixuan
 from chanlun.backtesting.backtest_trader import BackTestTrader
 from chanlun.backtesting.base import POSITION, Operation
-from chanlun.exchange.exchange_qmt import ExchangeQMTFutures
+from chanlun.exchange.exchange_qmt import ExchangeQMTFutures, USE_BIGQMT
 from chanlun.db import db
 
-from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
-from xtquant.xttype import StockAccount, XtAsset, XtOrder, XtPosition
-from xtquant import xtconstant
+if USE_BIGQMT:
+    # 大 QMT 桥接：通过 xtquant_big_convert 兼容层（ZMQ RPC）驱动大 QMT 交易端
+    from bigqmt_signal_trader.xtquant_compat import (
+        XtQuantTrader,
+        XtQuantTraderCallback,
+        StockAccount,
+    )
+    from bigqmt_signal_trader import xtquant_compat as xtconstant
+else:
+    # miniQMT：xtquant SDK 直连 userdata_mini
+    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+    from xtquant.xttype import StockAccount
+    from xtquant import xtconstant
 
 
 class MyXtQuantTraderCallback(XtQuantTraderCallback):
@@ -83,14 +93,25 @@ class QMTTraderFutures(BackTestTrader):
         # 最大持仓数量
         self.max_pos = 5
 
-        # path为mini qmt客户端安装目录下userdata_mini路径
-        self.qmt_path = r"D:\国金证券QMT交易端\userdata_mini"
-        # session_id为会话编号
-        self.session_id = int(time.time())
-        self.xt_trader = XtQuantTrader(self.qmt_path, self.session_id)
-        # 创建资金账号，账号类型为 FUTURE
-        self.acc = StockAccount("809222890", "FUTURE")  # TODO 替换自己的期货资金账号
-        
+        # 期货资金账号（大 QMT 桥接时 QMT 端需登录该账号并运行桥接服务）
+        self.account_id = "809222890"  # TODO 替换自己的期货资金账号
+
+        if USE_BIGQMT:
+            # 大 QMT 桥接：端口按账号自动派生（15560 + 账号数字 % 100）
+            self.qmt_path = None
+            self.session_id = int(time.time())
+            self.xt_trader = XtQuantTrader(account_id=self.account_id)
+            # 账号类型为 FUTURE
+            self.acc = StockAccount(self.account_id, "FUTURE")
+        else:
+            # path为mini qmt客户端安装目录下userdata_mini路径
+            self.qmt_path = r"D:\国金证券QMT交易端\userdata_mini"
+            # session_id为会话编号
+            self.session_id = int(time.time())
+            self.xt_trader = XtQuantTrader(self.qmt_path, self.session_id)
+            # 创建资金账号，账号类型为 FUTURE
+            self.acc = StockAccount(self.account_id, "FUTURE")
+
         # 创建交易回调类对象
         self.trader_callback = MyXtQuantTraderCallback()
         self.xt_trader.register_callback(self.trader_callback)
@@ -112,9 +133,9 @@ class QMTTraderFutures(BackTestTrader):
         for _ in range(10):
             time.sleep(1)
             order = self.xt_trader.query_stock_order(self.acc, order_id)
-            if order and order.order_status in [xtconstant.ORDER_SUCCEEDED, xtconstant.ORDER_PART_SUCCEEDED]:
+            if order and order.order_status in [xtconstant.ORDER_SUCCEEDED, xtconstant.ORDER_PART_SUCC]:
                 return order
-            if order and order.order_status in [xtconstant.ORDER_FAILED, xtconstant.ORDER_CANCELED]:
+            if order and order.order_status in [xtconstant.ORDER_JUNK, xtconstant.ORDER_CANCELED]:
                 print(f"订单失败或取消 {order.order_status}")
                 return None
         print("订单超时未完全成交")
@@ -178,7 +199,7 @@ class QMTTraderFutures(BackTestTrader):
                     stock_code=self.ex.code_to_qmt(code),
                     order_type=xtconstant.STOCK_BUY, # 买入
                     order_volume=int(amount),
-                    price_type=xtconstant.MARKET_PEGS, # 必须使用某种市价或限价，这里用跟盘价? 或者 FIX_PRICE
+                    price_type=xtconstant.LATEST_PRICE, # 最新价（原 MARKET_PEGS 常量不存在，运行时会报错）
                     price=price, 
                     strategy_name="cl",
                     order_remark=opt.msg
@@ -232,7 +253,7 @@ class QMTTraderFutures(BackTestTrader):
                     stock_code=self.ex.code_to_qmt(code),
                     order_type=xtconstant.STOCK_SELL, # 卖出
                     order_volume=int(amount),
-                    price_type=xtconstant.MARKET_PEGS,
+                    price_type=xtconstant.LATEST_PRICE,
                     price=price,
                     strategy_name="cl",
                     order_remark=opt.msg
@@ -289,7 +310,7 @@ class QMTTraderFutures(BackTestTrader):
                 stock_code=self.ex.code_to_qmt(code),
                 order_type=xtconstant.STOCK_SELL, 
                 order_volume=int(amount),
-                price_type=xtconstant.MARKET_PEGS,
+                price_type=xtconstant.LATEST_PRICE,
                 price=price,
                 strategy_name="cl",
                 order_remark=opt.msg
@@ -337,7 +358,7 @@ class QMTTraderFutures(BackTestTrader):
                 stock_code=self.ex.code_to_qmt(code),
                 order_type=xtconstant.STOCK_BUY, 
                 order_volume=int(amount),
-                price_type=xtconstant.MARKET_PEGS,
+                price_type=xtconstant.LATEST_PRICE,
                 price=price,
                 strategy_name="cl",
                 order_remark=opt.msg

@@ -159,6 +159,10 @@ predict
 .vscode
 
 src/xtquant
+# 大 QMT 桥接客户端包（来自 xtquant_big_convert，不入库）
+src/bigqmt_signal_trader/
+# 大 QMT 桥接客户端私有配置（含资金账号，不入库）
+src/bigqmt_signal_trader_client_config.py
 
 # 配置文件排除
 /src/chanlun/config.py
@@ -175,3 +179,7 @@ src/cl_myquant/gmcache
 /my_debug
 
 .chanlun_pro
+
+趋势浪子交易体系2025
+
+src/bigqmt_signal_trader/

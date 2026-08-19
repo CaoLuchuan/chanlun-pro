@@ -1,4 +1,17 @@
 #:  -*- coding: utf-8 -*-
+import os
+import subprocess
+import sys
+
+# 确保运行在项目 venv 中（直接用系统 python 运行会缺少 pymysql/pyzmq 等依赖）
+if __name__ == "__main__" and os.environ.get("CL_NO_REEXEC") != "1":
+    _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _venv_py = os.path.join(_root, ".venv", "Scripts", "python.exe")
+    if not os.path.exists(_venv_py):
+        _venv_py = os.path.join(_root, ".venv", "bin", "python")
+    if os.path.exists(_venv_py) and os.path.abspath(sys.executable).lower() != os.path.abspath(_venv_py).lower():
+        sys.exit(subprocess.run([_venv_py, os.path.abspath(__file__)] + sys.argv[1:]).returncode)
+
 import datetime
 import time
 import traceback

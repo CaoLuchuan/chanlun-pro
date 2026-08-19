@@ -3,7 +3,7 @@ name = "chanlun-pro"
 version = "1.0.0"
 description = "chanlun pro"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "akshare>=1.16.98",
     "alpaca-py>=0.40.1",
@@ -36,6 +36,7 @@ dependencies = [
     "pymysql>=1.1.1",
     "pytdx",
     "pytest>=8.4.1",
+    "pyzmq>=26.0.3",
     "redis>=6.2.0",
     "requests>=2.32.3",
     "scipy>=1.15.3",

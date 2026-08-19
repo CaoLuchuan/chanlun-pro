@@ -24,14 +24,24 @@ except Exception:
 
 from chanlun import fun
 from chanlun.exchange.exchange import Exchange, Tick, convert_stock_kline_frequency
+
+# 大 QMT 桥接（xtquant_big_convert）：优先使用兼容层，通过 ZMQ RPC 驱动大 QMT 交易端；
+# 未部署桥接时回退到原 miniQMT（xtquant SDK 直连 userdata_mini）。
 try:
-    from xtquant import xtdata
+    from bigqmt_signal_trader import xtquant_compat as _bigqmt_compat
+
+    xtdata = _bigqmt_compat.xtdata
+    USE_BIGQMT = True
 except Exception:
-    xtdata = None
+    USE_BIGQMT = False
+    try:
+        from xtquant import xtdata
+    except Exception:
+        xtdata = None
 
 import re
 """
-QMT 沪深行情
+QMT 沪深行情（支持大 QMT 桥接与 miniQMT 两种接入方式）
 """
 
 
@@ -43,9 +53,14 @@ class ExchangeQMT(Exchange):
 
     def __init__(self):
         if xtdata is None:
-            raise Exception("xtquant 未安装或不可用，无法使用 QMT 行情。请确认 xtquant 已放入 src 目录并可正常 import。")
+            raise Exception(
+                "xtquant 未安装或不可用，无法使用 QMT 行情。"
+                "大 QMT 模式需部署 xtquant_big_convert 桥接（src/bigqmt_signal_trader + 客户端配置）；"
+                "miniQMT 模式需将 xtquant 放入 src 目录。"
+            )
 
-        xtdata.enable_hello = False
+        if hasattr(xtdata, "enable_hello"):
+            xtdata.enable_hello = False
 
         # 设置时区
         self.tz = pytz.timezone("Asia/Shanghai")
@@ -97,6 +112,131 @@ class ExchangeQMT(Exchange):
         返回整市场订阅所需的 QMT 市场列表，默认由子类实现。
         """
         return []
+
+    def _bigqmt_download_start_date(self, frequency: str, args):
+        """
+        大 QMT 模式下根据周期计算历史数据补充下载的起始日期（与 miniQMT 逻辑一致）
+        """
+        if frequency in ["1m", "3m"]:
+            download_start_date = fun.datetime_to_str(
+                datetime.datetime.now() - datetime.timedelta(days=180), "%Y%m%d"
+            )
+        elif frequency in ["5m", "10m", "15m", "30m", "60m", "2h", "4h", "6h"]:
+            download_start_date = fun.datetime_to_str(
+                datetime.datetime.now() - datetime.timedelta(days=2880), "%Y%m%d"
+            )
+        else:
+            download_start_date = ""
+        if args is not None and "download_start_date" in args:
+            download_start_date = args["download_start_date"]
+        return download_start_date
+
+    def _bigqmt_normalize_kline_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        大 QMT 桥接返回的 K 线 DataFrame 列归一化：
+        统一为 time(毫秒时间戳)/open/high/low/close/volume
+        """
+        df = df.copy()
+        df.columns = [str(_c) for _c in df.columns]
+        # 兼容大 QMT 复数形式的列名
+        plural_map = {
+            "opens": "open", "highs": "high", "lows": "low",
+            "closes": "close", "volumes": "volume",
+        }
+        df = df.rename(columns={k: v for k, v in plural_map.items() if k in df.columns})
+
+        if "time" not in df.columns:
+            if "stime" in df.columns:
+                # stime 形如 '20240101150000'（北京时间），转为毫秒时间戳
+                digits = df["stime"].astype(str).str.extract(r"(\d{8,14})")[0].str.pad(
+                    14, side="right", fillchar="0"
+                )
+                dt = pd.to_datetime(digits, format="%Y%m%d%H%M%S", errors="coerce")
+                df["time"] = dt.dt.tz_localize(self.tz).apply(
+                    lambda x: int(x.timestamp() * 1000) if pd.notna(x) else None
+                )
+            else:
+                # 兜底：索引为时间字符串
+                idx = df.index.astype(str).str.extract(r"(\d{8,14})")[0].str.pad(
+                    14, side="right", fillchar="0"
+                )
+                dt = pd.to_datetime(idx, format="%Y%m%d%H%M%S", errors="coerce")
+                df["time"] = dt.dt.tz_localize(self.tz).apply(
+                    lambda x: int(x.timestamp() * 1000) if pd.notna(x) else None
+                )
+        df["time"] = pd.to_numeric(df["time"], errors="coerce")
+
+        need_cols = ["time", "open", "high", "low", "close", "volume"]
+        for _c in need_cols:
+            if _c not in df.columns:
+                raise ValueError(f"大 QMT K线数据缺少列 {_c}，实际列：{list(df.columns)}")
+        df = df[need_cols].dropna(subset=["time"])
+        return df
+
+    def _bigqmt_fetch_klines(
+        self,
+        qmt_code: str,
+        frequency: str,
+        qmt_frequency: str,
+        start_date: str,
+        req_counts: int,
+        dividend_type: str,
+        args,
+    ) -> Union[pd.DataFrame, None]:
+        """
+        大 QMT 桥接模式：通过 RPC 获取 K 线，返回含 time/open/high/low/close/volume 的 DataFrame
+        """
+        def _fetch() -> pd.DataFrame:
+            data = xtdata.get_market_data_ex(
+                field_list=[],
+                stock_list=[qmt_code],
+                period=qmt_frequency,
+                start_time=start_date.replace("-", "").replace(":", "").replace(" ", "") if start_date else "",
+                end_time="",
+                count=req_counts,
+                dividend_type=dividend_type,
+                fill_data=False,
+                # 首次全量拉取（如 1m 180天约4万根）服务端需现下载数据，默认6秒超时不够
+                timeout_seconds=120,
+            )
+            if not isinstance(data, dict):
+                return None
+            df = data.get(qmt_code)
+            if df is None or len(df) == 0:
+                return None
+            return df
+
+        try:
+            df = _fetch()
+        except Exception as e:
+            print(f"大 QMT 获取K线异常 {qmt_code}-{frequency}: {e}")
+            df = None
+
+        if df is None:
+            # 服务端无数据，触发历史数据补充下载后重试（QMT 端 down_history_data 同步下载）
+            download_start_date = self._bigqmt_download_start_date(frequency, args)
+            try:
+                xtdata.download_history_data(
+                    qmt_code,
+                    qmt_frequency,
+                    start_time=download_start_date,
+                    end_time="",
+                    incrementally=True,
+                    dividend_type=dividend_type,
+                )
+                df = _fetch()
+            except Exception as e:
+                print(f"大 QMT 下载历史数据异常 {qmt_code}-{frequency}: {e}")
+                return None
+
+        if df is None:
+            return None
+
+        try:
+            return self._bigqmt_normalize_kline_df(df)
+        except Exception as e:
+            print(f"大 QMT K线数据解析异常 {qmt_code}-{frequency}: {e}")
+            return None
 
     @retry(
         stop=stop_after_attempt(3),
@@ -161,83 +301,95 @@ class ExchangeQMT(Exchange):
 
         qmt_code = self.code_to_qmt(code)
 
-        # 首先检查当前是否有数据
-        kline_exists = xtdata.get_market_data(
-            field_list=[],
-            stock_list=[qmt_code],
-            period=frequency_map[frequency],
-            start_time="",
-            end_time="",
-            count=1,
-            dividend_type=dividend_type,
-            fill_data=False,
-        )
-        if kline_exists is None or kline_exists["time"].empty:
-            # 如果没有数据，则全量下载
-            s_time = time.time()
-            # 根据周期，决定下载的时间起始日期
-            if frequency in ["1m", "3m"]:
-                download_start_date = fun.datetime_to_str(
-                    datetime.datetime.now() - datetime.timedelta(days=180), "%Y%m%d"
-                )
-            elif frequency in ["5m", "10m", "15m", "30m", "60m", "2h", "4h", "6h"]:
-                download_start_date = fun.datetime_to_str(
-                    datetime.datetime.now() - datetime.timedelta(days=2880), "%Y%m%d"
-                )
-            else:
-                download_start_date = ""
-            if args is not None and "download_start_date" in args:
-                download_start_date = args["download_start_date"]
-
-            xtdata.download_history_data(
-                qmt_code,
-                frequency_map[frequency],
-                start_time=download_start_date,
-                end_time="",
-                incrementally=True,
+        if USE_BIGQMT:
+            # 大 QMT 桥接：get_market_data_ex 返回 {code: DataFrame}，
+            # 平时直接从服务端（QMT 终端内存）实时拉取，无需增量下载；
+            # 无数据时触发服务端历史数据补充下载后重试。
+            klines_df = self._bigqmt_fetch_klines(
+                qmt_code, frequency, frequency_map[frequency], start_date,
+                req_counts, dividend_type, args,
             )
-            # print(f"{code}-{frequency} 全量下载历史数据耗时：{time.time() - s_time}")
+            if klines_df is None:
+                return None
         else:
-            # 增量下载
-            # s_time = time.time()
-            xtdata.download_history_data(
-                qmt_code,
-                frequency_map[frequency],
+            # 首先检查当前是否有数据
+            kline_exists = xtdata.get_market_data(
+                field_list=[],
+                stock_list=[qmt_code],
+                period=frequency_map[frequency],
                 start_time="",
                 end_time="",
-                incrementally=True,
+                count=1,
+                dividend_type=dividend_type,
+                fill_data=False,
             )
-            # print(f"{code}-{frequency} 增量下载历史数据耗时：{time.time() - s_time}")
+            if kline_exists is None or kline_exists["time"].empty:
+                # 如果没有数据，则全量下载
+                s_time = time.time()
+                # 根据周期，决定下载的时间起始日期
+                if frequency in ["1m", "3m"]:
+                    download_start_date = fun.datetime_to_str(
+                        datetime.datetime.now() - datetime.timedelta(days=180), "%Y%m%d"
+                    )
+                elif frequency in ["5m", "10m", "15m", "30m", "60m", "2h", "4h", "6h"]:
+                    download_start_date = fun.datetime_to_str(
+                        datetime.datetime.now() - datetime.timedelta(days=2880), "%Y%m%d"
+                    )
+                else:
+                    download_start_date = ""
+                if args is not None and "download_start_date" in args:
+                    download_start_date = args["download_start_date"]
 
-        # s_time = time.time()
-        qmt_klines = xtdata.get_market_data(
-            field_list=[],
-            stock_list=[qmt_code],
-            period=frequency_map[frequency],
-            start_time=start_date.replace("-", "").replace(":", "").replace(" ", "") if start_date else "",
-            end_time="",
-            count=req_counts,
-            dividend_type=dividend_type,
-            fill_data=False,
-        )
-        # print(f"{code}-{frequency} 获取历史数据耗时：{time.time() - s_time}")
+                xtdata.download_history_data(
+                    qmt_code,
+                    frequency_map[frequency],
+                    start_time=download_start_date,
+                    end_time="",
+                    incrementally=True,
+                )
+                # print(f"{code}-{frequency} 全量下载历史数据耗时：{time.time() - s_time}")
+            else:
+                # 增量下载
+                # s_time = time.time()
+                xtdata.download_history_data(
+                    qmt_code,
+                    frequency_map[frequency],
+                    start_time="",
+                    end_time="",
+                    incrementally=True,
+                )
+                # print(f"{code}-{frequency} 增量下载历史数据耗时：{time.time() - s_time}")
 
-        if qmt_klines is None:
-            return None
-        
-        # 检查是否有数据
-        for _k, _v in qmt_klines.items():
-            if _v.empty:
+            # s_time = time.time()
+            qmt_klines = xtdata.get_market_data(
+                field_list=[],
+                stock_list=[qmt_code],
+                period=frequency_map[frequency],
+                start_time=start_date.replace("-", "").replace(":", "").replace(" ", "") if start_date else "",
+                end_time="",
+                count=req_counts,
+                dividend_type=dividend_type,
+                fill_data=False,
+            )
+            # print(f"{code}-{frequency} 获取历史数据耗时：{time.time() - s_time}")
+
+            if qmt_klines is None:
                 return None
 
-        s_time = time.time()
-        try:
-            klines_df = pd.DataFrame(
-                {key: value.values[0] for key, value in qmt_klines.items()}
-            )
-        except Exception as e:
-            print(f"QMT klines error: {e}")
-            return None
+            # 检查是否有数据
+            for _k, _v in qmt_klines.items():
+                if _v.empty:
+                    return None
+
+            s_time = time.time()
+            try:
+                klines_df = pd.DataFrame(
+                    {key: value.values[0] for key, value in qmt_klines.items()}
+                )
+            except Exception as e:
+                print(f"QMT klines error: {e}")
+                return None
+
         klines_df["code"] = code
 
         klines_df["date"] = pd.to_datetime(
@@ -274,7 +426,10 @@ class ExchangeQMT(Exchange):
         获取股票名称
         """
         qmt_code = self.code_to_qmt(code)
-        stock_detail = xtdata.get_instrument_detail(qmt_code, False)
+        if USE_BIGQMT:
+            stock_detail = xtdata.get_instrument_detail(qmt_code)
+        else:
+            stock_detail = xtdata.get_instrument_detail(qmt_code, False)
         if stock_detail is None or "InstrumentName" not in stock_detail:
             return None
         return {
@@ -324,8 +479,19 @@ class ExchangeQMT(Exchange):
         获取股票除权除息信息
         """
         df = xtdata.get_divid_factors(self.code_to_qmt(stock_code))
-        if df is None or df.empty:
+        if df is None or len(df) == 0:
             return None
+        if "time" not in getattr(df, "columns", []):
+            # 大 QMT 返回的除权数据可能不带 time 列（time 在索引中）
+            if USE_BIGQMT:
+                try:
+                    df = df.reset_index()
+                    if "time" not in df.columns:
+                        return None
+                except Exception:
+                    return None
+            else:
+                return None
         df.loc[:, "stock_code"] = stock_code
         df["divid_date"] = pd.to_datetime(df["time"] / 1000, unit="s")
         return df
@@ -418,6 +584,8 @@ class ExchangeQMTStock(ExchangeQMT):
     QMT A股行情
     """
     g_all_stocks = []
+    g_bigqmt_codes = set()
+
     def code_to_tdx(self, code: str):
         """
         QMT 格式：600519.SH
@@ -442,6 +610,29 @@ class ExchangeQMTStock(ExchangeQMT):
             return _c[1] + "." + _c[0]
         return code
 
+    # 大 QMT 模式下 A 股常用指数（QMT 格式；整市场 tick 走 RPC 数据量过大，指数不在板块列表中）
+    BIGQMT_INDEX_CODES = [
+        "000001.SH", "000016.SH", "000300.SH", "000905.SH", "000852.SH",
+        "000688.SH", "399001.SZ", "399006.SZ", "399016.SZ", "399300.SZ",
+        "399905.SZ", "399852.SZ",
+    ]
+
+    def _bigqmt_a_stock_codes(self) -> set:
+        """
+        大 QMT 模式：通过板块列表获取全部 A股/ETF 代码（QMT 格式），加常用指数
+        """
+        if len(self.g_bigqmt_codes) > 0:
+            return self.g_bigqmt_codes
+        codes = set()
+        for _sector in ("沪深A股", "沪深ETF"):
+            try:
+                codes.update(xtdata.get_stock_list_in_sector(_sector))
+            except Exception as e:
+                print(f"大 QMT 获取板块 {_sector} 失败: {e}")
+        codes.update(self.BIGQMT_INDEX_CODES)
+        self.g_bigqmt_codes = codes
+        return codes
+
     def all_stocks(self):
         if len(self.g_all_stocks) > 0:
             return self.g_all_stocks
@@ -454,19 +645,30 @@ class ExchangeQMTStock(ExchangeQMT):
             "SZ.980001", "SZ.980023",
         ]
 
-        ticks = xtdata.get_full_tick(["SH", "SZ", "BJ"])
-        tick_codes = list(ticks.keys())
-
         all_stocks = []
-        for _c in tick_codes:
-            _stock_type: dict = xtdata.get_instrument_type(_c)
-            if _stock_type.get("stock") or _stock_type.get("etf") or _stock_type.get("index"):
-                pass
-            else:
-                continue
-            _stock = self.stock_info(self.code_to_tdx(_c))
-            if _stock:
-                all_stocks.append(_stock)
+        if USE_BIGQMT:
+            # 大 QMT：整市场 tick（约5万行）单次 RPC 数据量过大易超时，
+            # 改用板块列表（各一次 RPC）获取代码，再逐个取合约信息
+            tick_codes = sorted(self._bigqmt_a_stock_codes())
+            for _c in tick_codes:
+                _tdx_code = self.code_to_tdx(_c)
+                if _tdx_code in black_codes:
+                    continue
+                _stock = self.stock_info(_tdx_code)
+                if _stock:
+                    all_stocks.append(_stock)
+        else:
+            ticks = xtdata.get_full_tick(["SH", "SZ", "BJ"])
+            tick_codes = list(ticks.keys())
+            for _c in tick_codes:
+                _stock_type: dict = xtdata.get_instrument_type(_c)
+                if _stock_type.get("stock") or _stock_type.get("etf") or _stock_type.get("index"):
+                    pass
+                else:
+                    continue
+                _stock = self.stock_info(self.code_to_tdx(_c))
+                if _stock:
+                    all_stocks.append(_stock)
 
         all_stocks = [_s for _s in all_stocks if _s["code"] not in black_codes]
         self.g_all_stocks = all_stocks
@@ -475,8 +677,22 @@ class ExchangeQMTStock(ExchangeQMT):
     def all_ticks(self) -> Dict[str, Tick]:
         ticks = {}
         all_stocks = self.all_stocks()
-        all_codes = [_s["code"] for _s in all_stocks]
-        qmt_ticks = xtdata.get_full_tick(["SH", "SZ", "BJ"])
+        all_codes = set(_s["code"] for _s in all_stocks)
+
+        if USE_BIGQMT:
+            # 大 QMT：整市场 tick 单次 RPC 过大，按代码分批拉取
+            qmt_codes = sorted(self._bigqmt_a_stock_codes())
+            qmt_ticks = {}
+            batch_size = 100
+            for i in range(0, len(qmt_codes), batch_size):
+                batch = qmt_codes[i:i + batch_size]
+                try:
+                    qmt_ticks.update(xtdata.get_full_tick(batch) or {})
+                except Exception as e:
+                    print(f"大 QMT 批量 tick 获取失败（{batch[0]} 起）: {e}")
+        else:
+            qmt_ticks = xtdata.get_full_tick(["SH", "SZ", "BJ"])
+
         for _c, _t in qmt_ticks.items():
             _tdx_code = self.code_to_tdx(_c)
             if _tdx_code not in all_codes:
@@ -559,7 +775,16 @@ class ExchangeQMTFutures(ExchangeQMT):
             return self.g_all_stocks
 
         # 获取所有期货 tick
-        ticks = xtdata.get_full_tick(["SF", "IF", "DF", "ZF", "INE", "GF"])
+        try:
+            ticks = xtdata.get_full_tick(["SF", "IF", "DF", "ZF", "INE", "GF"])
+        except Exception as e:
+            if USE_BIGQMT:
+                # 大 QMT 端未订阅期货行情时市场级快照超时/为空；
+                # 单代码 ticks()/klines() 不受影响，仅全市场代码列表不可用
+                print(f"大 QMT 获取期货全市场 tick 失败（QMT 端可能未订阅期货行情）: {e}")
+                self.g_all_stocks = []
+                return self.g_all_stocks
+            raise
         tick_codes = list(ticks.keys())
 
         all_stocks = []
@@ -587,8 +812,13 @@ class ExchangeQMTFutures(ExchangeQMT):
 
             # 尝试获取类型判断，如果获取不到，默认保留（如果是纯期货格式）
             _stock_type: dict = xtdata.get_instrument_type(_c)
-            if _stock_type and not _stock_type.get("future"):
-                continue
+            if _stock_type:
+                # 大 QMT 桥接的服务端可能用代码前缀兜底实现 get_instrument_type，
+                # 返回结果不含 future 键，此时依赖上方正则过滤即可
+                if "future" in _stock_type and not _stock_type["future"]:
+                    continue
+                if "future" not in _stock_type and not USE_BIGQMT:
+                    continue
             
             # 过滤掉非主力合约或过期合约? 
             # 暂时不过滤，获取所有
@@ -603,7 +833,13 @@ class ExchangeQMTFutures(ExchangeQMT):
         ticks = {}
         all_stocks = self.all_stocks()
         all_codes = [_s["code"] for _s in all_stocks]
-        qmt_ticks = xtdata.get_full_tick(["SF", "IF", "DF", "ZF", "INE", "GF"])
+        try:
+            qmt_ticks = xtdata.get_full_tick(["SF", "IF", "DF", "ZF", "INE", "GF"])
+        except Exception as e:
+            if USE_BIGQMT:
+                print(f"大 QMT 获取期货全市场 tick 失败: {e}")
+                return ticks
+            raise
         for _c, _t in qmt_ticks.items():
             _tdx_code = self.code_to_tdx(_c)
             if _tdx_code not in all_codes:
@@ -692,7 +928,16 @@ class ExchangeQMTOption(ExchangeQMT):
         # 获取所有期权 tick
         # 期权市场通常包括 沪深ETF期权(SHO, SZO) 和 股指期权/商品期权(中金所IF, 郑商所ZF, 大商所DF, 上期所SF)
         markets = ["SHO", "SZO", "SF", "IF", "DF", "ZF", "INE", "GF"]
-        ticks = xtdata.get_full_tick(markets)
+        try:
+            ticks = xtdata.get_full_tick(markets)
+        except Exception as e:
+            if USE_BIGQMT:
+                # 大 QMT 端未订阅期权/期货行情时市场级快照超时/为空；
+                # 单代码 ticks()/klines() 不受影响，仅全市场代码列表不可用
+                print(f"大 QMT 获取期权全市场 tick 失败（QMT 端可能未订阅期权行情）: {e}")
+                self.g_all_stocks = []
+                return self.g_all_stocks
+            raise
         tick_codes = list(ticks.keys())
 
         all_stocks = []
@@ -733,7 +978,13 @@ class ExchangeQMTOption(ExchangeQMT):
         all_stocks = self.all_stocks()
         all_codes = [_s["code"] for _s in all_stocks]
         markets = ["SHO", "SZO", "SF", "IF", "DF", "ZF", "INE", "GF"]
-        qmt_ticks = xtdata.get_full_tick(markets)
+        try:
+            qmt_ticks = xtdata.get_full_tick(markets)
+        except Exception as e:
+            if USE_BIGQMT:
+                print(f"大 QMT 获取期权全市场 tick 失败: {e}")
+                return ticks
+            raise
         for _c, _t in qmt_ticks.items():
             _tdx_code = self.code_to_tdx(_c)
             if _tdx_code not in all_codes:

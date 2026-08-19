@@ -4,12 +4,22 @@ from typing import List
 from chanlun import utils, zixuan
 from chanlun.backtesting.backtest_trader import BackTestTrader
 from chanlun.backtesting.base import POSITION, Operation
-from chanlun.exchange.exchange_qmt import ExchangeQMTStock
+from chanlun.exchange.exchange_qmt import ExchangeQMTStock, USE_BIGQMT
 from chanlun.db import db
 
-from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
-from xtquant.xttype import StockAccount, XtAsset, XtOrder, XtPosition
-from xtquant import xtconstant
+if USE_BIGQMT:
+    # 大 QMT 桥接：通过 xtquant_big_convert 兼容层（ZMQ RPC）驱动大 QMT 交易端
+    from bigqmt_signal_trader.xtquant_compat import (
+        XtQuantTrader,
+        XtQuantTraderCallback,
+        StockAccount,
+    )
+    from bigqmt_signal_trader import xtquant_compat as xtconstant
+else:
+    # miniQMT：xtquant SDK 直连 userdata_mini
+    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+    from xtquant.xttype import StockAccount
+    from xtquant import xtconstant
 
 
 class MyXtQuantTraderCallback(XtQuantTraderCallback):
@@ -83,13 +93,25 @@ class QMTTraderStock(BackTestTrader):
         # 最大持仓数量，当前持仓大于这个数量，则不进行实际交易
         self.max_pos = 5
 
-        # path为mini qmt客户端安装目录下userdata_mini路径
-        self.qmt_path = r"D:\国金证券QMT交易端\userdata_mini"
-        # session_id为会话编号，策略使用方对于不同的Python策略需要使用不同的会话编号
-        self.session_id = int(time.time())
-        self.xt_trader = XtQuantTrader(self.qmt_path, self.session_id)
-        # 创建资金账号为******的证券账号对象
-        self.acc = StockAccount("8886136661")  # TODO 替换自己的资金账号
+        # 资金账号（大 QMT 桥接与 miniQMT 共用；服务端需登录同一账号）
+        self.account_id = "8886136661"  # TODO 替换自己的资金账号
+
+        if USE_BIGQMT:
+            # 大 QMT 桥接：XtQuantTrader(account_id=...) 经 ZMQ RPC 连接 QMT 端桥接服务，
+            # 端口按账号自动派生（15560 + 账号数字 % 100），配置见 src/bigqmt_signal_trader_client_config.py
+            self.qmt_path = None
+            self.session_id = int(time.time())
+            self.xt_trader = XtQuantTrader(account_id=self.account_id)
+            self.acc = StockAccount(self.account_id)
+        else:
+            # path为mini qmt客户端安装目录下userdata_mini路径
+            self.qmt_path = r"D:\国金证券QMT交易端\userdata_mini"
+            # session_id为会话编号，策略使用方对于不同的Python策略需要使用不同的会话编号
+            self.session_id = int(time.time())
+            self.xt_trader = XtQuantTrader(self.qmt_path, self.session_id)
+            # 创建资金账号的证券账号对象
+            self.acc = StockAccount(self.account_id)
+
         # 创建交易回调类对象，并声明接收回调
         self.trader_callback = MyXtQuantTraderCallback()
         self.xt_trader.register_callback(self.trader_callback)
@@ -116,7 +138,7 @@ class QMTTraderStock(BackTestTrader):
 
         is_real_trade = True
         # 检查持仓数量
-        hold_positions: List[XtPosition] = self.xt_trader.query_stock_positions(
+        hold_positions = self.xt_trader.query_stock_positions(
             self.acc
         )
         hold_pos_num = len([_p for _p in hold_positions if _p.volume > 0])
@@ -129,7 +151,7 @@ class QMTTraderStock(BackTestTrader):
 
         if is_real_trade:
             # 计算开仓金额
-            account: XtAsset = self.xt_trader.query_stock_asset(self.acc)
+            account = self.xt_trader.query_stock_asset(self.acc)
             # 可用资金
             if account is None:
                 print("获取资金账户失败")
@@ -160,11 +182,11 @@ class QMTTraderStock(BackTestTrader):
                 for _ in range(10):
                     time.sleep(1)
                     order = self.xt_trader.query_stock_order(self.acc, order_id)
-                    if order and order.order_status in [xtconstant.ORDER_SUCCEEDED, xtconstant.ORDER_PART_SUCCEEDED]:
+                    if order and order.order_status in [xtconstant.ORDER_SUCCEEDED, xtconstant.ORDER_PART_SUCC]:
                         price = order.traded_price
                         amount = order.traded_volume
                         break
-                    if order and order.order_status in [xtconstant.ORDER_FAILED, xtconstant.ORDER_CANCELED]:
+                    if order and order.order_status in [xtconstant.ORDER_JUNK, xtconstant.ORDER_CANCELED]:
                         print(f"订单失败或取消 {order.order_status}")
                         is_real_trade = False
                         break
@@ -217,10 +239,10 @@ class QMTTraderStock(BackTestTrader):
         amount = pos.amount
 
         is_real_trade = False
-        hold_positions: List[XtPosition] = self.xt_trader.query_stock_positions(
+        hold_positions = self.xt_trader.query_stock_positions(
             self.acc
         )
-        hold_pos: XtPosition = None
+        hold_pos = None
         for _p in hold_positions:
             if _p.can_use_volume > 0 and _p.stock_code == self.ex.code_to_qmt(code):
                 hold_pos = _p
@@ -253,11 +275,11 @@ class QMTTraderStock(BackTestTrader):
             for _ in range(10):
                 time.sleep(1)
                 order = self.xt_trader.query_stock_order(self.acc, order_id)
-                if order and order.order_status in [xtconstant.ORDER_SUCCEEDED, xtconstant.ORDER_PART_SUCCEEDED]:
+                if order and order.order_status in [xtconstant.ORDER_SUCCEEDED, xtconstant.ORDER_PART_SUCC]:
                     price = order.traded_price
                     amount = order.traded_volume
                     break
-                if order and order.order_status in [xtconstant.ORDER_FAILED, xtconstant.ORDER_CANCELED]:
+                if order and order.order_status in [xtconstant.ORDER_JUNK, xtconstant.ORDER_CANCELED]:
                      print(f"订单失败或取消 {order.order_status}")
                      is_real_trade = False # 标记为失败，转模拟记录
                      break

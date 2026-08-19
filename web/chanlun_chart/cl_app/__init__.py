@@ -538,6 +538,9 @@ def create_app(test_config=None):
             # 如果开启并设置的该级别的低级别数据，获取低级别数据，并在转换成高级图表展示
             # s_time = time.time()
             klines = ex.klines(code, frequency_low)
+            # 无K线数据（如 QMT 未返回数据），返回 no_data，避免 500 错误
+            if klines is None or len(klines) == 0:
+                return {"s": "no_data"}
             # __log.info(f'{code} - {frequency_low} enable low to high get klines time : {time.time() - s_time}')
             # s_time = time.time()
             cd = web_batch_get_cl_datas(
@@ -548,6 +551,9 @@ def create_app(test_config=None):
             kchart_to_frequency = None
             # s_time = time.time()
             klines = ex.klines(code, frequency)
+            # 无K线数据（如 QMT 未返回数据），返回 no_data，避免 500 错误
+            if klines is None or len(klines) == 0:
+                return {"s": "no_data"}
             # __log.info(f'{code} - {frequency} get klines time : {time.time() - s_time}')
             # s_time = time.time()
             cd = web_batch_get_cl_datas(market, code, {frequency: klines}, cl_config)[0]
@@ -995,8 +1001,8 @@ def create_app(test_config=None):
         codes = request.form["codes"]
         codes = json.loads(codes)
         ex = get_exchange(Market(market))
-        stock_ticks = ex.ticks(codes)
         try:
+            stock_ticks = ex.ticks(codes)
             now_trading = ex.now_trading()
             res_ticks = [
                 {"code": _c, "price": _t.last, "rate": round(float(_t.rate), 2)}
@@ -1004,6 +1010,7 @@ def create_app(test_config=None):
             ]
             return {"now_trading": now_trading, "ticks": res_ticks}
         except Exception:
+            # QMT 端繁忙（如正在拉取历史K线）时 RPC 超时，返回空数据而非 500
             traceback.print_exc()
         return {"now_trading": False, "ticks": []}
 
