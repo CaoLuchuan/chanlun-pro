@@ -46,7 +46,7 @@ QMT 行情 / 交易（passorder、get_market_data_ex 等）
 | `script/crontab/reboot_sync_qmt_{stock,futures}_klines.py` | 启动时自动切换到项目 `.venv` 重新执行（避免系统 Python 缺 pymysql/pyzmq）；支持 `CL_SYNC_LIMIT`/`CL_SYNC_WORKERS` 环境变量 |
 | `.gitignore` | 排除 `src/bigqmt_signal_trader/`（桥接包）与 `src/bigqmt_signal_trader_client_config.py`（含资金账号） |
 
-### 2.2 xtquant_big_convert fork 侧（已推送，基线 v0.2.3 + 1 commit）
+### 2.2 xtquant_big_convert fork 侧（已推送，基线 v0.2.3 + 2 commits）
 
 fork 地址：https://github.com/CaoLuchuan/xtquant_big_convert
 本地 clone：`d:\quantitative\xtquant_big_convert`（remote `origin` = fork，`upstream` = litaolemo）
@@ -54,8 +54,10 @@ fork 地址：https://github.com/CaoLuchuan/xtquant_big_convert
 | 文件 | 改动 |
 |---|---|
 | `transports/zmq_transport.py` | **服务端 handler 线程池**（`handler_workers`，默认 4，0 = 关闭回旧行为）：router loop 原先串行 inline 执行 handler，一次全历史拉取（分钟级）期间所有 tick/快请求排队至超时；现 loop 只收发，handler 分发线程池并行，工作线程响应经既有队列由 socket 归属线程回发（zmq socket 不可跨线程）。**客户端每请求独立 DEALER socket**：原共享 socket 在锁内等待整个超时窗口，一个 120s 拉取让并发短请求排队 2 分钟 |
+| `adapters/market_bigqmt.py` | **期货/期权市场支持**（commit `2b62e33`，恢复部署目录里被上游同步覆盖的本地定制）：大 QMT 行情代码大小写敏感（`ag2612.SF`），期货/期权代码过 `normalize_stock_code` 会抛 ValueError，期货市场代码（SF/IF/DF/ZF/INE/GF/SHO/SZO）也不在市场集合里 → 期货 tick/合约列表/合约详情全不可用。新增 `FUTURES_OPTION_MARKET_SUFFIXES` + `_is_futures_option_code`：市场代码大写透传、期货代码原样透传；`get_instrument` 期货代码跳过归一化 |
 | `xtquant_compat.py` | `_call` 把 `timeout_seconds` 混进 `params` 发给服务端、从未传给 `client.call` → 所有显式超时静默失效（一律 6s）；`download_history_data` 转发漏传 `incrementally` → 每次全量下载 |
-| `tests/bigqmt_signal_trader/test_zmq_transport.py` | 新增 2 用例：慢 handler 不阻塞快请求、并发请求响应匹配。全套 374 passed |
+| `tests/bigqmt_signal_trader/test_zmq_transport.py` | 新增 2 用例：慢 handler 不阻塞快请求、并发请求响应匹配 |
+| `tests/bigqmt_signal_trader/test_bigqmt_adapters.py` | 新增期货代码透传回归测试（防止再次被上游同步静默丢弃）。全套 375 passed |
 | `CHANGELOG.md` | Unreleased 段落记录以上修复 |
 
 上游 v0.2.3 已包含且我们同步部署的：#51 异步下单事件保序屏障、#52 财务表名映射、#54 下载日期窗口/单股下载兜底/本地缓存时间轴修复。
