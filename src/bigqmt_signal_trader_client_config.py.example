@@ -1,0 +1,35 @@
+# coding: utf-8
+"""
+大 QMT 桥接客户端配置模板
+
+复制为 src/bigqmt_signal_trader_client_config.py 并填入自己的资金账号后使用。
+真实配置含资金账号，已在 .gitignore 排除，不入库。
+
+架构说明：
+    chanlun-pro（客户端，Python 3.11）
+        -> bigqmt_signal_trader.xtquant_compat（MiniQMT 兼容层）
+        -> ZMQ RPC（端口按资金账号自动派生）
+        -> 大 QMT 交易端内置 Python（服务端，QMT 策略编辑器加载 BIGQMT_REDIS_DRYRUN.py）
+
+RPC 端口派生规则（两端一致，无需配置）：
+    15560 + (资金账号数字 % 100)
+详细部署见：cookbook/docs/大QMT桥接部署指南.md
+"""
+
+# 默认资金账号（与 QMT 端 bigqmt_signal_trader_local_config.py 保持一致；
+# trader_qmt_*.py 中也可按市场传入不同账号）
+BIGQMT_ACCOUNT_ID = "8886136661"
+
+BIGQMT_REDIS_CONFIG = {
+    # 传输层使用 zmq（本机部署，无需 Redis 服务器；两端均需 pyzmq）
+    # 不配置 zmq.port 时，两端按账号自动派生端口，保持一致
+    "transport": "zmq",
+    # "zmq": {"handler_workers": 4},  # 服务端 handler 线程池，默认 4，0 关闭
+    # FormulaServer 直连快速路径（只读行情，默认开启，连不上自动回退 RPC）
+    "formula_server": {
+        "enabled": True,
+        "qmt_root": r"D:\国金证券QMT交易端",
+    },
+    # 默认 RPC 超时（秒）；长历史拉取/全市场 tick 由兼容层自行覆盖更长超时
+    "rpc_timeout_seconds": 6,
+}
