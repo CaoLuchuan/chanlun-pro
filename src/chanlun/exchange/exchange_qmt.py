@@ -730,6 +730,35 @@ class ExchangeQMTFutures(ExchangeQMT):
     QMT 期货行情
     """
     g_all_stocks = []
+
+    # 大 QMT 模式下按板块取期货合约列表：市场级快照（get_full_tick(["SF",...])）
+    # 在未订阅市场的 QMT 大端会超时，而交易所板块列表经 FormulaServer 直连毫秒级返回
+    BIGQMT_FUTURES_SECTORS = ("上期所", "中金所", "大商所", "郑商所", "广期所", "连续合约")
+    g_bigqmt_codes = []
+
+    def _bigqmt_futures_codes(self) -> list:
+        """
+        大 QMT 模式：通过交易所板块列表获取全部期货合约（QMT 格式，含连续合约），
+        过滤期权/组合/非标准代码
+        """
+        if len(self.g_bigqmt_codes) > 0:
+            return self.g_bigqmt_codes
+        codes = set()
+        for _sector in self.BIGQMT_FUTURES_SECTORS:
+            try:
+                codes.update(xtdata.get_stock_list_in_sector(_sector))
+            except Exception as e:
+                print(f"大 QMT 获取板块 {_sector} 失败: {e}")
+        # 过滤组合合约、期权、非标准代码，仅保留纯期货合约（rb2310 / 连续 rb00）
+        codes = {
+            _c for _c in codes
+            if "&" not in _c and " " not in _c
+            and "-C-" not in _c and "-P-" not in _c
+            and re.match(r"^[a-zA-Z]+[0-9]+$", _c.split(".")[0])
+        }
+        self.g_bigqmt_codes = sorted(codes)
+        return self.g_bigqmt_codes
+
     def default_code(self):
         return "SHFE.rb2310"
 
@@ -774,18 +803,14 @@ class ExchangeQMTFutures(ExchangeQMT):
         if len(self.g_all_stocks) > 0:
             return self.g_all_stocks
 
-        # 获取所有期货 tick
-        try:
+        if USE_BIGQMT:
+            # 大 QMT：市场级期货快照在未订阅市场的 QMT 端会超时，
+            # 改用交易所板块列表获取合约（FormulaServer 直连，毫秒级）
+            tick_codes = self._bigqmt_futures_codes()
+        else:
+            # 获取所有期货 tick
             ticks = xtdata.get_full_tick(["SF", "IF", "DF", "ZF", "INE", "GF"])
-        except Exception as e:
-            if USE_BIGQMT:
-                # 大 QMT 端未订阅期货行情时市场级快照超时/为空；
-                # 单代码 ticks()/klines() 不受影响，仅全市场代码列表不可用
-                print(f"大 QMT 获取期货全市场 tick 失败（QMT 端可能未订阅期货行情）: {e}")
-                self.g_all_stocks = []
-                return self.g_all_stocks
-            raise
-        tick_codes = list(ticks.keys())
+            tick_codes = list(ticks.keys())
 
         all_stocks = []
         for _c in tick_codes:
@@ -810,16 +835,15 @@ class ExchangeQMTFutures(ExchangeQMT):
             except Exception:
                 continue
 
-            # 尝试获取类型判断，如果获取不到，默认保留（如果是纯期货格式）
-            _stock_type: dict = xtdata.get_instrument_type(_c)
-            if _stock_type:
-                # 大 QMT 桥接的服务端可能用代码前缀兜底实现 get_instrument_type，
-                # 返回结果不含 future 键，此时依赖上方正则过滤即可
-                if "future" in _stock_type and not _stock_type["future"]:
-                    continue
-                if "future" not in _stock_type and not USE_BIGQMT:
-                    continue
-            
+            if not USE_BIGQMT:
+                # 尝试获取类型判断，如果获取不到，默认保留（如果是纯期货格式）
+                _stock_type: dict = xtdata.get_instrument_type(_c)
+                if _stock_type:
+                    if "future" in _stock_type and not _stock_type["future"]:
+                        continue
+                    if "future" not in _stock_type:
+                        continue
+
             # 过滤掉非主力合约或过期合约? 
             # 暂时不过滤，获取所有
             _stock = self.stock_info(self.code_to_tdx(_c))
@@ -833,13 +857,20 @@ class ExchangeQMTFutures(ExchangeQMT):
         ticks = {}
         all_stocks = self.all_stocks()
         all_codes = [_s["code"] for _s in all_stocks]
-        try:
+
+        if USE_BIGQMT:
+            # 大 QMT：市场级期货快照会超时，按合约代码分批拉取 tick
+            qmt_codes = self._bigqmt_futures_codes()
+            qmt_ticks = {}
+            batch_size = 100
+            for i in range(0, len(qmt_codes), batch_size):
+                batch = qmt_codes[i:i + batch_size]
+                try:
+                    qmt_ticks.update(xtdata.get_full_tick(batch) or {})
+                except Exception as e:
+                    print(f"大 QMT 批量 tick 获取失败（{batch[0]} 起）: {e}")
+        else:
             qmt_ticks = xtdata.get_full_tick(["SF", "IF", "DF", "ZF", "INE", "GF"])
-        except Exception as e:
-            if USE_BIGQMT:
-                print(f"大 QMT 获取期货全市场 tick 失败: {e}")
-                return ticks
-            raise
         for _c, _t in qmt_ticks.items():
             _tdx_code = self.code_to_tdx(_c)
             if _tdx_code not in all_codes:
